@@ -1,260 +1,258 @@
-// The story: three jobs that chain cafe owner Mara Voss's errands into dockmaster
-// Ren Okafor's fight for the harbour. Each mission is a small state machine —
-// briefing dialogue, one or two objectives, a payoff dialogue — and a timed-out
-// job stays dead until the player leaves the area, so it never nags twice.
-import { addWanted } from './police.js';
-import { distance } from './geom.js';
+// The story: three jobs for Marina, the harbour fixer, strung in a line. A courier run, a
+// borrowed convertible, and a debt collected at the warehouse — each pays cash into the
+// save, each teaches one system (driving, stealing under heat, fighting and escaping).
+// Timed work that fails goes cold: the player must leave the area before it re-arms, so
+// nobody stands on the spot farming retries.
+import { PLACE_CAFE, PLACE_GARAGE, PLACE_PIER, PLACE_WAREHOUSE } from './world.js';
 
-/** Distance from a failed job's trigger that re-arms it. */
-const REARM_DISTANCE = 320;
-/** Seconds to carry the case across town in Dock Run. */
-const DELIVERY_TIME = 200;
-/** The Vireo must arrive with more than this much health to be worth fencing. */
-const DELIVERY_MIN_HEALTH = 25;
+/** Where Marina waits, on the promenade by the old pier. */
+export const MARINA = { x: 1006, y: 2450, label: 'Marina' };
 
+/** Mission names and pay, in story order. */
 export const MISSION_DEFS = [
-  {
-    id: 'dock-run',
-    name: 'Dock Run',
-    contact: 'Mara Voss',
-    trigger: 'cafe',
-    reward: 300,
-    intro: [
-      { who: 'Mara Voss', text: 'Juno. Sit. You look like someone who can drive and not ask questions.' },
-      { who: 'Juno', text: 'I can do both of those things separately.' },
-      { who: 'Mara Voss', text: 'A locked case came in on the morning boat. It sits on the south pier, and it is getting warmer by the minute.' },
-      { who: 'Mara Voss', text: 'Fetch it, then take it to the Sunset Diner across town. Fast, but not famous. Understand?' },
-      { who: 'Juno', text: 'Fast, not famous. On it.' },
-    ],
-    outro: [
-      { who: 'Mara Voss', text: 'The diner called. Case delivered, nobody famous. That is exactly my kind of help.' },
-      { who: 'Mara Voss', text: 'Here is your cut. Come back tomorrow — the harbour has been restless.' },
-    ],
-  },
-  {
-    id: 'borrowed-wings',
-    name: 'Borrowed Wings',
-    contact: 'Mara Voss',
-    trigger: 'cafe',
-    reward: 500,
-    intro: [
-      { who: 'Mara Voss', text: 'See the coral Vireo GT parked at the plaza? It belongs to a dealer who owes me four months of rent.' },
-      { who: 'Juno', text: 'And you want it… borrowed.' },
-      { who: 'Mara Voss', text: 'Repossessed. Take it to Harborlight Garage, north-east corner. My cousin strips the tracker there.' },
-      { who: 'Mara Voss', text: 'The alarm will sing and the police will come. Bring it back whole, Juno — a wreck is worth nothing.' },
-    ],
-    outro: [
-      { who: 'Mara Voss', text: 'Whole, shiny, and only slightly illegal. My cousin says the tracker is already in the bay.' },
-      { who: 'Mara Voss', text: 'You have a gift. One more favour — Ren at the harbour needs hands, not questions.' },
-    ],
-  },
-  {
-    id: 'harbor-cleanup',
-    name: 'Harbor Cleanup',
-    contact: 'Ren Okafor',
-    trigger: 'warehouse',
-    reward: 800,
-    intro: [
-      { who: 'Ren Okafor', text: 'You are Mara\'s driver? Then you are the closest thing to help this dock has.' },
-      { who: 'Ren Okafor', text: 'The Breakers took Breakwater Storage last week. Four of them, loud and armed, scaring every crew off the pier.' },
-      { who: 'Juno', text: 'And you want them… tidied.' },
-      { who: 'Ren Okafor', text: 'I want my harbour back. Clear them out, then come see me. The dock pays its debts.' },
-    ],
-    outro: [
-      { who: 'Ren Okafor', text: 'Quiet docks. Do you hear that? That is the sound of a working harbour.' },
-      { who: 'Ren Okafor', text: 'Neon Harbor owes you, Juno. Mara, the crews, me — we will not forget it.' },
-    ],
-  },
+  { name: 'La primera entrega', pay: 300 },
+  { name: 'Coche prestado', pay: 500 },
+  { name: 'Limpieza del puerto', pay: 800 },
 ];
 
-export function createMissionState() {
+const DELIVER_TIME = 150;
+const REARM_DISTANCE = 320;
+
+export function createMissions() {
   return {
     index: 0,
-    phase: 'available', // available | briefing | active | outro | cooldown | complete
-    objective: null,
-    timer: null,
-    data: {},
-    cooldownPoi: null,
-    homeSpot: null,
+    phase: 'contact',
+    stage: null,
+    timer: 0,
+    hasPackage: false,
+    targetCarId: 0,
+    dialogue: null,
+    afterDialogue: null,
+    marker: null,
+    objective: '',
+    gangLeft: 0,
   };
 }
 
-/** Where the current job can be picked up, or null when no job is waiting. */
-export function missionTrigger(state) {
-  const m = state.missions;
-  if (m.phase !== 'available' || m.index >= MISSION_DEFS.length) return null;
-  const def = MISSION_DEFS[m.index];
-  const poi = state.city.pois[def.trigger];
-  return { x: poi.x, y: poi.y, def };
+function talk(state, speaker, lines, after) {
+  state.dialogue = { speaker, lines, at: 0, index: 0 };
+  state.afterDialogue = after;
 }
 
-/** Open the briefing dialogue for the current job. */
-export function startBriefing(state) {
-  const m = state.missions;
-  const def = MISSION_DEFS[m.index];
-  m.phase = 'briefing';
-  state.dialogue = { lines: def.intro, index: 0, after: `start-${def.id}` };
+function startMission(ctx, state) {
+  const world = ctx.world;
+  if (state.index === 0) {
+    state.stage = 'pickup';
+    state.marker = world.places[PLACE_PIER];
+    state.objective = 'Pick up the package at Muelle Viejo';
+  } else if (state.index === 1) {
+    const car = ctx.spawnMissionCar();
+    state.targetCarId = car.id;
+    state.stage = 'steal';
+    state.marker = { x: car.x, y: car.y, label: 'Convertible' };
+    state.objective = 'Steal the coral convertible by the beach club';
+  } else if (state.index === 2) {
+    state.stage = 'go';
+    state.marker = world.places[PLACE_WAREHOUSE];
+    state.objective = 'Go to Almacén 9, the harbour warehouse';
+  }
+  state.phase = 'active';
 }
 
-/** A dialogue just ended: start the job it briefed, or close out the one it ended. */
-export function onDialogueFinished(state, after) {
-  const m = state.missions;
-  const def = MISSION_DEFS[m.index];
-  if (after === `start-${def.id}`) {
-    m.phase = 'active';
-    activateMission(state, def);
-  } else if (after === `done-${def.id}`) {
-    m.index += 1;
-    m.objective = null;
-    m.timer = null;
-    m.data = {};
-    m.phase = m.index >= MISSION_DEFS.length ? 'complete' : 'available';
-    state.dirtySave = true;
+function completeMission(ctx, state) {
+  const pay = MISSION_DEFS[state.index].pay;
+  ctx.money += pay;
+  ctx.events.push({ type: 'cash', amount: pay });
+  ctx.toast(`Job done — $${pay}`);
+  state.index += 1;
+  state.stage = null;
+  state.hasPackage = false;
+  if (state.index >= MISSION_DEFS.length) {
+    state.phase = 'done';
+    state.marker = null;
+    state.objective = 'The harbour is yours. Free roam — the city saves your cash.';
+    talk(state, 'Marina', ['Three jobs, three payments, no names asked.', 'You are not a courier any more, Rio. You are a professional.'], null);
+  } else {
+    state.phase = 'contact';
+    state.marker = MARINA;
+    state.objective = 'Meet Marina by the harbour';
   }
 }
 
-/** Set up the first objective (and any actors) for a job that just started. */
-function activateMission(state, def) {
-  const m = state.missions;
-  const pois = state.city.pois;
-  m.data = {};
-  if (def.id === 'dock-run') {
-    m.data.stage = 'pickup';
-    m.objective = { x: pois.pier.x, y: pois.pier.y, radius: 52, kind: 'pickup', text: 'Pick up the locked case on the south pier' };
-  } else if (def.id === 'borrowed-wings') {
-    const car = state.cars.find((c) => c.missionTarget);
-    m.data.stolen = false;
-    m.homeSpot = { x: car.x, y: car.y, angle: car.angle };
-    m.objective = { x: car.x, y: car.y, radius: 60, kind: 'steal', text: 'Steal the coral Vireo GT at the plaza', carId: car.id };
-  } else if (def.id === 'harbor-cleanup') {
-    state.spawnGang();
-    m.objective = { x: pois.warehouse.x, y: pois.warehouse.y, radius: 90, kind: 'clear', text: 'Clear the Breakers out of Breakwater Storage' };
-  }
-}
+const INTROS = [
+  ['Rio. I need a package moved, quiet and quick.', 'It waits at the end of Muelle Viejo. Bring it to Café Sol — while it is still warm.'],
+  ['A collector owes me a car. Coral convertible, parked by the beach club.', 'His driver watches it, so it will be loud. Bring it to Taller Mar in one piece.'],
+  ['Last job. The crew at Almacén 9 stopped paying their harbour dues.', 'Clear them out, then lose the police. After that, we are even.'],
+];
 
-/** Pay the reward and roll into the payoff dialogue. */
-function completeMission(state, def) {
-  const m = state.missions;
-  state.player.money += def.reward;
-  state.stats.earned += def.reward;
-  state.dirtySave = true;
-  pushFloater(state, state.player.x, state.player.y - 26, `+$${def.reward}`, '#7ee787');
-  m.phase = 'outro';
-  m.objective = null;
-  m.timer = null;
-  state.dialogue = { lines: def.outro, index: 0, after: `done-${def.id}` };
-}
-
-/** Kill the current job without pay; it re-arms only once the player leaves. */
-function failMission(state, def, reason, poi) {
-  const m = state.missions;
-  m.phase = 'cooldown';
-  m.objective = null;
-  m.timer = null;
-  m.data = {};
-  m.cooldownPoi = poi;
-  state.message = { text: `Job failed — ${reason}`, sub: 'Leave the area and the job will come up again.', t: 0, ttl: 3.6 };
-}
-
-/** The simulation tells the missions when the player climbs into a car. */
-export function onPlayerEnteredCar(state, car) {
-  const m = state.missions;
-  if (m.phase !== 'active' || !car.missionTarget || m.data.stolen) return;
-  m.data.stolen = true;
-  addWanted(state, 2);
-  const garage = state.city.pois.garage;
-  m.objective = { x: garage.x, y: garage.y, radius: 80, kind: 'deliverCar', text: 'Deliver the Vireo GT to Harborlight Garage — keep it whole', carId: car.id };
-  state.message = { text: 'The alarm sings. The police are coming.', sub: 'Lose them or outrun them — but bring the car back whole.', t: 0, ttl: 3.2 };
-}
-
-/** Being busted or wasted mid-delivery drops the case back on the pier. */
-export function onPlayerRespawn(state) {
-  const m = state.missions;
-  if (m.phase === 'active' && MISSION_DEFS[m.index].id === 'dock-run' && m.data.stage === 'deliver') {
-    m.data.stage = 'pickup';
-    m.timer = null;
-    const pier = state.city.pois.pier;
-    m.objective = { x: pier.x, y: pier.y, radius: 52, kind: 'pickup', text: 'Pick up the locked case on the south pier (again)' };
-  }
-}
-
-/** Advance every live job: timers, arrivals, body counts, cooldown re-arming. */
-export function stepMissions(state, dt) {
-  const m = state.missions;
-  const player = state.player;
-  if (m.phase === 'cooldown') {
-    if (m.cooldownPoi && distance(player.x, player.y, m.cooldownPoi.x, m.cooldownPoi.y) > REARM_DISTANCE) {
-      m.phase = 'available';
-      m.cooldownPoi = null;
-      // A wrecked or moved Vireo goes back to the plaza for another try.
-      if (MISSION_DEFS[m.index].id === 'borrowed-wings') resetTargetCar(state);
+/** Advance the story one step. ctx is the simulation (see sim.js for its shape). */
+export function stepMissions(ctx, dt) {
+  const state = ctx.missions;
+  const player = ctx.player;
+  const world = ctx.world;
+  if (state.dialogue) {
+    state.dialogue.at += dt;
+    if (state.dialogue.at > 3.6) {
+      state.dialogue.at = 0;
+      state.dialogue.index += 1;
+      if (state.dialogue.index >= state.dialogue.lines.length) {
+        state.dialogue = null;
+        const after = state.afterDialogue;
+        state.afterDialogue = null;
+        if (after === 'start') startMission(ctx, state);
+      }
     }
     return;
   }
-  if (m.phase !== 'active') return;
-  const def = MISSION_DEFS[m.index];
-  const obj = m.objective;
-  if (!obj) return;
+  if (state.phase === 'contact') {
+    state.marker = MARINA;
+    state.objective = 'Meet Marina by the harbour';
+    if (Math.hypot(player.x - MARINA.x, player.y - MARINA.y) < 48 && !player.car) {
+      talk(state, 'Marina', INTROS[state.index], 'start');
+    }
+    return;
+  }
+  if (state.phase !== 'active' && state.phase !== 'cooldown') return;
 
-  if (def.id === 'dock-run') {
-    if (m.data.stage === 'pickup' && distance(player.x, player.y, obj.x, obj.y) < obj.radius) {
-      m.data.stage = 'deliver';
-      m.timer = DELIVERY_TIME;
-      const diner = state.city.pois.diner;
-      m.objective = { x: diner.x, y: diner.y, radius: 66, kind: 'deliver', text: 'Take the case to the Sunset Diner — before it goes cold' };
-      state.message = { text: 'Case in hand.', sub: 'The clock is running.', t: 0, ttl: 2.4 };
-    } else if (m.data.stage === 'deliver') {
-      m.timer -= dt;
-      if (m.timer <= 0) {
-        failMission(state, def, 'the case went cold.', state.city.pois.cafe);
-      } else if (distance(player.x, player.y, obj.x, obj.y) < obj.radius) {
-        completeMission(state, def);
-      }
+  if (state.index === 0) stepFirstJob(ctx, state, dt);
+  else if (state.index === 1) stepSecondJob(ctx, state);
+  else if (state.index === 2) stepThirdJob(ctx, state);
+}
+
+function stepFirstJob(ctx, state, dt) {
+  const player = ctx.player;
+  const pier = ctx.world.places[PLACE_PIER];
+  if (state.phase === 'cooldown') {
+    state.objective = 'The drop went cold. Leave the pier area.';
+    state.marker = null;
+    if (Math.hypot(player.x - pier.x, player.y - pier.y) > REARM_DISTANCE) {
+      state.phase = 'active';
+      state.stage = 'pickup';
+      state.marker = pier;
+      state.objective = 'Pick up the package at Muelle Viejo';
+      ctx.toast('Marina: one more time. Do not be late.');
     }
-  } else if (def.id === 'borrowed-wings') {
-    const car = state.cars.find((c) => c.id === obj.carId);
-    if (!car) return;
-    if (!m.data.stolen) {
-      obj.x = car.x;
-      obj.y = car.y;
-      if (car.wrecked) failMission(state, def, 'the Vireo is a wreck.', state.city.pois.plaza);
-    } else if (player.car === car && distance(player.x, player.y, obj.x, obj.y) < obj.radius) {
-      if (car.health > DELIVERY_MIN_HEALTH) completeMission(state, def);
-      else failMission(state, def, 'the Vireo arrived too damaged to fence.', state.city.pois.garage);
-    } else if (car.wrecked) {
-      failMission(state, def, 'the Vireo is a wreck.', state.city.pois.garage);
+    return;
+  }
+  if (state.stage === 'pickup') {
+    if (Math.hypot(player.x - pier.x, player.y - pier.y) < 46) {
+      state.hasPackage = true;
+      state.stage = 'deliver';
+      state.timer = DELIVER_TIME;
+      state.marker = ctx.world.places[PLACE_CAFE];
+      state.objective = 'Deliver the package to Café Sol — fast';
+      talk(state, 'Marina · phone', ['You have it? Good. Café Sol, and do not stop for anyone.'], null);
+      ctx.events.push({ type: 'pickup' });
     }
-  } else if (def.id === 'harbor-cleanup') {
-    const alive = state.peds.filter((ped) => ped.role === 'gang' && !ped.dead).length;
-    if (m.data.returning) {
-      if (distance(player.x, player.y, obj.x, obj.y) < obj.radius) completeMission(state, def);
-    } else {
-      obj.text = `Clear the Breakers out of Breakwater Storage — ${alive} left`;
-      if (alive === 0) {
-        m.data.returning = true;
-        const ren = state.city.pois.warehouse;
-        m.objective = { x: ren.x, y: ren.y, radius: 62, kind: 'return', text: 'Report back to Ren at the warehouse gate' };
-        state.message = { text: 'The storage yard is quiet.', sub: 'Go and see Ren.', t: 0, ttl: 2.6 };
-      }
+  } else if (state.stage === 'deliver') {
+    state.timer -= dt;
+    const cafe = ctx.world.places[PLACE_CAFE];
+    if (Math.hypot(player.x - cafe.x, player.y - cafe.y) < 52) {
+      completeMission(ctx, state);
+    } else if (state.timer <= 0) {
+      state.hasPackage = false;
+      state.phase = 'cooldown';
+      ctx.toast('Too late — the buyer walked away.');
     }
   }
 }
 
-/** Put the Vireo back at the plaza, whole, ready to be stolen again. */
-function resetTargetCar(state) {
-  const m = state.missions;
-  const car = state.cars.find((c) => c.missionTarget);
-  if (!car || !m.homeSpot) return;
-  car.x = m.homeSpot.x;
-  car.y = m.homeSpot.y;
-  car.angle = m.homeSpot.angle;
-  car.speed = 0;
-  car.health = 100;
-  car.wrecked = false;
-  if (car.driver === 'player') return;
-  car.driver = null;
+function targetCar(ctx, state) {
+  return ctx.cars.find((car) => car.id === state.targetCarId) ?? null;
 }
 
-function pushFloater(state, x, y, text, color) {
-  state.floaters.push({ x, y, text, color, t: 0, ttl: 1.4 });
+function stepSecondJob(ctx, state) {
+  const player = ctx.player;
+  const garage = ctx.world.places[PLACE_GARAGE];
+  const car = targetCar(ctx, state);
+  if (state.phase === 'cooldown') {
+    state.objective = 'The car is a write-off. Walk away; Marina will find another.';
+    state.marker = null;
+    if (car && Math.hypot(player.x - car.x, player.y - car.y) > REARM_DISTANCE) {
+      ctx.removeCar(car);
+      const fresh = ctx.spawnMissionCar();
+      state.targetCarId = fresh.id;
+      state.phase = 'active';
+      state.stage = 'steal';
+    }
+    return;
+  }
+  if (!car) return;
+  if (state.stage === 'steal') {
+    state.marker = { x: car.x, y: car.y, label: 'Convertible' };
+    state.objective = 'Steal the coral convertible by the beach club';
+  } else if (state.stage === 'deliver') {
+    state.marker = garage;
+    state.objective = 'Deliver the convertible to Taller Mar — intact';
+    if (car.health <= 25) {
+      state.phase = 'cooldown';
+      ctx.toast('The convertible is wrecked. Marina will not pay for scrap.');
+    }
+  }
+}
+
+function stepThirdJob(ctx, state) {
+  const player = ctx.player;
+  const warehouse = ctx.world.places[PLACE_WAREHOUSE];
+  if (state.stage === 'go') {
+    if (Math.hypot(player.x - warehouse.x, player.y - warehouse.y) < 64) {
+      ctx.spawnGangFight();
+      state.gangLeft = ctx.gang.length;
+      state.stage = 'fight';
+      ctx.wanted.stars = Math.max(ctx.wanted.stars, 2);
+      ctx.wanted.evade = 0;
+      talk(state, 'Radio', ['Shots at the harbour! Units respond — the law is coming either way.'], null);
+      ctx.events.push({ type: 'fight-start' });
+    }
+  } else if (state.stage === 'fight') {
+    state.gangLeft = ctx.gang.filter((m) => m.state !== 'down').length;
+    state.objective = `Clear the warehouse crew — ${state.gangLeft} left`;
+    state.marker = warehouse;
+    if (state.gangLeft <= 0) {
+      state.stage = 'escape';
+      state.marker = null;
+      state.objective = 'Lose the heat';
+      ctx.toast('Crew cleared. Now disappear.');
+    }
+  } else if (state.stage === 'escape') {
+    state.objective = 'Lose the heat';
+    if (ctx.wanted.stars === 0) completeMission(ctx, state);
+  }
+}
+
+/** Called by the simulation the moment the player takes the marked convertible. */
+export function onTargetStolen(ctx) {
+  const state = ctx.missions;
+  if (state.index !== 1 || state.stage !== 'steal') return;
+  state.stage = 'deliver';
+  ctx.wanted.stars = Math.max(ctx.wanted.stars, 2);
+  ctx.wanted.evade = 0;
+  ctx.events.push({ type: 'crime', kind: 'theft', stars: ctx.wanted.stars });
+  ctx.toast('The owner saw that. Move!');
+}
+
+/** Called by the simulation when the player parks the marked car at the garage. */
+export function onTargetDelivered(ctx) {
+  const state = ctx.missions;
+  if (state.index === 1 && state.stage === 'deliver' && state.phase === 'active') completeMission(ctx, state);
+}
+
+/** Busted or wasted mid-job: packages drop, fights reset, the story waits. */
+export function onPlayerDown(ctx) {
+  const state = ctx.missions;
+  state.dialogue = null;
+  state.afterDialogue = null;
+  if (state.phase !== 'active') return;
+  if (state.index === 0 && state.stage === 'deliver') {
+    state.hasPackage = false;
+    state.stage = 'pickup';
+    state.marker = ctx.world.places[PLACE_PIER];
+    state.objective = 'Pick up the package at Muelle Viejo';
+  }
+  if (state.index === 2 && (state.stage === 'fight' || state.stage === 'escape')) {
+    ctx.clearGang();
+    state.stage = 'go';
+    state.marker = ctx.world.places[PLACE_WAREHOUSE];
+    state.objective = 'Go to Almacén 9, the harbour warehouse';
+  }
 }
