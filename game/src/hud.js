@@ -1,275 +1,274 @@
-// The HUD and the screens around the play: health and cash, the wanted stars (the highest
-// blinks while the player is breaking contact), the mission line with its distance and
-// countdown, a live minimap with police blips, dialogue and toasts, and the title / pause
-// / busted / wasted panels. Everything here is screen-space drawing over the world.
-import { BUST_TIME, EVADE_TIME, ROADS_H, ROADS_V, WATER_Y, WORLD_HEIGHT, WORLD_WIDTH } from './config.js';
-import { MARINA } from './missions.js';
+// The interface layer: health, money, stars and the arrest meter; the objective pill with
+// its distance (and the dock-run clock); a live minimap with police and objective blips;
+// the dialogue box; and the title / pause / busted / wasted overlays. Pure screen-space
+// drawing over the world frame — it reads state, never changes it.
+import { VIEW, WORLD, WATER_Y, AVENUES, STREETS, PALETTE, FONT } from './config.js';
 
-const FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif';
-
-function pill(ctx, x, y, w, h, alpha) {
-  ctx.fillStyle = `rgba(12,16,26,${alpha})`;
+function panel(ctx, x, y, w, h, alpha = 0.72) {
+  ctx.fillStyle = `rgba(10,14,22,${alpha})`;
   ctx.beginPath();
-  ctx.roundRect(x, y, w, h, 10);
+  ctx.roundRect(x, y, w, h, 9);
   ctx.fill();
 }
 
-function star(ctx, cx, cy, r, filled, alpha) {
+function star(ctx, cx, cy, r, filled, flash) {
   ctx.beginPath();
   for (let i = 0; i < 10; i += 1) {
     const rad = i % 2 === 0 ? r : r * 0.45;
     const a = -Math.PI / 2 + (i * Math.PI) / 5;
-    const px = cx + Math.cos(a) * rad;
-    const py = cy + Math.sin(a) * rad;
-    if (i === 0) ctx.moveTo(px, py);
-    else ctx.lineTo(px, py);
+    const x = cx + Math.cos(a) * rad;
+    const y = cy + Math.sin(a) * rad;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
   }
   ctx.closePath();
   if (filled) {
-    ctx.fillStyle = `rgba(255,197,0,${alpha})`;
+    ctx.fillStyle = flash ? '#ffe9a8' : PALETTE.star;
     ctx.fill();
-  }
-  ctx.strokeStyle = `rgba(255,197,0,${alpha})`;
-  ctx.lineWidth = 1.6;
-  ctx.stroke();
-}
-
-function drawMinimap(ctx, sim, view) {
-  const w = 192;
-  const h = 144;
-  const x = view.w - w - 14;
-  const y = 14;
-  const sx = w / WORLD_WIDTH;
-  const sy = h / WORLD_HEIGHT;
-  ctx.save();
-  ctx.beginPath();
-  ctx.roundRect(x, y, w, h, 10);
-  ctx.clip();
-  ctx.fillStyle = '#0e8ba0';
-  ctx.fillRect(x, y, w, h);
-  ctx.fillStyle = '#e8dcbc';
-  ctx.fillRect(x, y, w, WATER_Y * sy);
-  ctx.fillStyle = '#7cc463';
-  const park = sim.world.park;
-  ctx.fillRect(x + park.x * sx, y + park.y * sy, park.w * sx, park.h * sy);
-  ctx.strokeStyle = '#4b4b54';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  for (const cx of ROADS_V) { ctx.moveTo(x + cx * sx, y); ctx.lineTo(x + cx * sx, y + h); }
-  for (const cy of ROADS_H) { ctx.moveTo(x, y + cy * sy); ctx.lineTo(x + w, y + cy * sy); }
-  ctx.stroke();
-  const dot = (wx, wy, color, r) => {
-    ctx.fillStyle = color;
-    ctx.beginPath(); ctx.arc(x + wx * sx, y + wy * sy, r, 0, Math.PI * 2); ctx.fill();
-  };
-  if (sim.missions.phase === 'contact') dot(MARINA.x, MARINA.y, '#22d3ee', 3);
-  for (const member of sim.gang) if (member.state !== 'down') dot(member.x, member.y, '#ff3b30', 3);
-  const blink = Math.floor(sim.time * 2.4) % 2 === 0;
-  for (const car of sim.cars) {
-    if (car.kind === 'cop' && car.driver === 'cop') dot(car.x, car.y, blink ? '#ff3b30' : '#3b82f6', 3.2);
-  }
-  const marker = sim.missions.marker;
-  if (marker) {
-    const pulse = 3.4 + Math.sin(sim.time * 5) * 1.1;
-    dot(marker.x, marker.y, '#ffd60a', pulse);
-  }
-  dot(sim.player.x, sim.player.y, '#ffffff', 3.6);
-  ctx.restore();
-  ctx.strokeStyle = 'rgba(255,255,255,0.65)';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.roundRect(x, y, w, h, 10);
-  ctx.stroke();
-  return { x, y, w, h };
-}
-
-export function drawHud(ctx, sim, view) {
-  const player = sim.player;
-  const wanted = sim.wanted;
-  ctx.font = `600 15px ${FONT}`;
-  ctx.textAlign = 'left';
-  // Health and cash, top-left.
-  pill(ctx, 14, 14, 196, 30, 0.55);
-  ctx.fillStyle = 'rgba(255,255,255,0.25)';
-  ctx.fillRect(52, 24, 148, 10);
-  ctx.fillStyle = player.hp > 34 ? '#4ade80' : '#f87171';
-  ctx.fillRect(52, 24, 148 * Math.max(0, player.hp) / 100, 10);
-  ctx.fillStyle = '#ffffff';
-  ctx.fillText('RIO', 22, 34);
-  pill(ctx, 14, 50, 196, 30, 0.55);
-  ctx.fillStyle = '#ffd60a';
-  ctx.font = `700 17px ${FONT}`;
-  ctx.fillText(`$ ${sim.money.toLocaleString('en-US')}`, 24, 71);
-  if (sim.missions.hasPackage) {
-    ctx.fillStyle = '#ffd60a';
-    ctx.fillRect(150, 58, 13, 13);
-    ctx.fillStyle = '#20242e';
-    ctx.font = `700 9px ${FONT}`;
-    ctx.fillText('PKG', 151, 68);
-  }
-  // Minimap and wanted stars, top-right.
-  const map = drawMinimap(ctx, sim, view);
-  if (wanted.stars > 0) {
-    for (let i = 0; i < 5; i += 1) {
-      const active = i < wanted.stars;
-      let alpha = active ? 1 : 0.28;
-      if (active && !wanted.seen && i === wanted.stars - 1) alpha = 0.45 + 0.4 * Math.sin(sim.time * 7);
-      star(ctx, map.x + 18 + i * 34, map.y + map.h + 24, 13, active, alpha);
-    }
-    if (!wanted.seen && wanted.stars > 0) {
-      ctx.fillStyle = 'rgba(255,255,255,0.3)';
-      ctx.fillRect(map.x + 4, map.y + map.h + 44, 150, 5);
-      ctx.fillStyle = '#ffd60a';
-      ctx.fillRect(map.x + 4, map.y + map.h + 44, 150 * Math.min(1, wanted.evade / EVADE_TIME), 5);
-    }
-  }
-  // Mission line, top-centre, with distance and countdown.
-  const missions = sim.missions;
-  if (missions.objective) {
-    let text = missions.objective;
-    if (missions.marker) {
-      const d = Math.hypot(player.x - missions.marker.x, player.y - missions.marker.y);
-      text += `  ·  ${Math.round(d / 10)} m`;
-    }
-    ctx.font = `600 15px ${FONT}`;
-    const tw = ctx.measureText(text).width + 30;
-    pill(ctx, (view.w - tw) / 2, 14, tw, 32, 0.6);
-    ctx.fillStyle = '#ffffff';
-    ctx.textAlign = 'center';
-    ctx.fillText(text, view.w / 2, 35);
-    if (missions.stage === 'deliver' && missions.index === 0 && missions.phase === 'active') {
-      const left = Math.max(0, Math.ceil(missions.timer));
-      ctx.font = `700 15px ${FONT}`;
-      ctx.fillStyle = left < 30 ? '#f87171' : '#ffd60a';
-      ctx.fillText(`${left}s`, view.w / 2, 62);
-    }
-    ctx.textAlign = 'left';
-  }
-  // Toasts under the mission line.
-  ctx.font = `600 14px ${FONT}`;
-  ctx.textAlign = 'center';
-  sim.toasts.forEach((toast, i) => {
-    ctx.fillStyle = `rgba(255,255,255,${Math.min(1, toast.ttl)})`;
-    ctx.fillText(toast.text, view.w / 2, 92 + i * 20);
-  });
-  ctx.textAlign = 'left';
-  // Bottom-right: speed in a car, ammunition on foot.
-  ctx.font = `700 20px ${FONT}`;
-  ctx.fillStyle = '#ffffff';
-  ctx.textAlign = 'right';
-  if (player.car) {
-    ctx.fillText(`${Math.round(Math.abs(player.car.speed) * 0.36)} km/h`, view.w - 18, view.h - 20);
-  } else if (player.reloading > 0) {
-    ctx.fillStyle = '#ffd60a';
-    ctx.fillText('RELOADING', view.w - 18, view.h - 20);
   } else {
-    ctx.fillText(`PISTOL ${player.ammo} / 12`, view.w - 18, view.h - 20);
+    ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
   }
+}
+
+function drawMinimap(ctx, state) {
+  const W = 196;
+  const H = 142;
+  const x0 = 16;
+  const y0 = VIEW.height - H - 16;
+  panel(ctx, x0 - 4, y0 - 4, W + 8, H + 8, 0.66);
+  const s = Math.min(W / WORLD.width, H / WORLD.height);
+  const ox = x0 + (W - WORLD.width * s) / 2;
+  const oy = y0 + (H - WORLD.height * s) / 2;
+  ctx.fillStyle = '#cdbb96';
+  ctx.fillRect(ox, oy, WORLD.width * s, WORLD.height * s);
+  ctx.fillStyle = PALETTE.water;
+  ctx.fillRect(ox, oy + WATER_Y * s, WORLD.width * s, (WORLD.height - WATER_Y) * s);
+  ctx.strokeStyle = 'rgba(90,84,70,0.8)';
+  ctx.lineWidth = 1;
+  for (const cx of AVENUES) {
+    ctx.beginPath();
+    ctx.moveTo(ox + cx * s, oy);
+    ctx.lineTo(ox + cx * s, oy + WORLD.height * s);
+    ctx.stroke();
+  }
+  for (const cy of STREETS) {
+    ctx.beginPath();
+    ctx.moveTo(ox, oy + cy * s);
+    ctx.lineTo(ox + WORLD.width * s, oy + cy * s);
+    ctx.stroke();
+  }
+  const dot = (x, y, colour, r) => {
+    ctx.fillStyle = colour;
+    ctx.beginPath();
+    ctx.arc(ox + x * s, oy + y * s, r, 0, Math.PI * 2);
+    ctx.fill();
+  };
+  if (state.objective) dot(state.objective.x, state.objective.y, PALETTE.marker, 3.6);
+  for (const car of state.cars) {
+    if (car.kind === 'police' && car.health > 0 && !car.calm) {
+      dot(car.x, car.y, Math.sin(state.time * 9) > 0 ? '#3b6fe2' : '#e23b3b', 2.6);
+    }
+  }
+  const p = state.player;
+  dot(p.x, p.y, '#ffffff', 3.4);
+  ctx.strokeStyle = '#10141c';
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  ctx.arc(ox + p.x * s, oy + p.y * s, 3.4, 0, Math.PI * 2);
+  ctx.stroke();
+}
+
+function drawDialogue(ctx, state) {
+  const d = state.dialogue;
+  if (!d) return;
+  const line = d.lines[d.i];
+  const w = 620;
+  const x = (VIEW.width - w) / 2;
+  const y = VIEW.height - 118;
+  panel(ctx, x, y, w, 86, 0.86);
+  ctx.fillStyle = PALETTE.marker;
+  ctx.font = `800 14px ${FONT}`;
   ctx.textAlign = 'left';
-  // Arrest meter over the player while an officer has him pinned.
-  if (wanted.bust > 0.04) {
-    const perWorld = view.w / 1180;
-    const px = (player.x - view.cx) * perWorld + view.w / 2;
-    const py = (player.y - view.cy) * perWorld + view.h / 2;
-    pill(ctx, px - 46, py - 64, 92, 16, 0.7);
-    ctx.fillStyle = '#f87171';
-    ctx.fillRect(px - 42, py - 60, 84 * Math.min(1, wanted.bust / BUST_TIME), 8);
-    ctx.font = `700 10px ${FONT}`;
-    ctx.fillStyle = '#ffffff';
-    ctx.textAlign = 'center';
-    ctx.fillText('ARRESTING', px, py - 70);
-    ctx.textAlign = 'left';
+  ctx.fillText(line.who.toUpperCase(), x + 18, y + 26);
+  ctx.fillStyle = '#f2f4f8';
+  ctx.font = `16px ${FONT}`;
+  // Word-wrap by hand: measure, break, two lines at most.
+  const words = line.text.split(' ');
+  const lines = [''];
+  for (const word of words) {
+    const trial = lines[lines.length - 1] ? `${lines[lines.length - 1]} ${word}` : word;
+    if (ctx.measureText(trial).width > w - 36 && lines[lines.length - 1]) lines.push(word);
+    else lines[lines.length - 1] = trial;
   }
-  // Dialogue, bottom-centre.
-  const dialogue = missions.dialogue;
-  if (dialogue) {
-    const line = dialogue.lines[dialogue.index];
-    const w = Math.min(700, view.w - 48);
-    const x = (view.w - w) / 2;
-    const y = view.h - 118;
-    pill(ctx, x, y, w, 84, 0.78);
-    ctx.font = `700 14px ${FONT}`;
-    ctx.fillStyle = '#22d3ee';
-    ctx.fillText(dialogue.speaker, x + 18, y + 26);
-    ctx.font = `16px ${FONT}`;
-    ctx.fillStyle = '#ffffff';
-    ctx.fillText(line, x + 18, y + 54);
+  lines.slice(0, 2).forEach((text, i) => ctx.fillText(text, x + 18, y + 52 + i * 20));
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.font = `12px ${FONT}`;
+  ctx.textAlign = 'right';
+  ctx.fillText('E ▸', x + w - 14, y + 76);
+}
+
+export function drawHud(ctx, state, screen, ui) {
+  ctx.textAlign = 'left';
+  const p = state.player;
+
+  if (screen === 'play' || screen === 'paused') {
+    // Health and money, top-left.
+    panel(ctx, 14, 14, 208, 62);
+    ctx.fillStyle = '#fff';
+    ctx.font = `800 13px ${FONT}`;
+    ctx.fillText('RIO', 26, 36);
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.fillRect(58, 26, 150, 11);
+    const hpFrac = Math.max(0, p.health / 100);
+    ctx.fillStyle = hpFrac > 0.3 ? '#57d977' : '#e23b3b';
+    ctx.fillRect(58, 26, 150 * hpFrac, 11);
+    ctx.fillStyle = PALETTE.money;
+    ctx.font = `800 19px ${FONT}`;
+    ctx.fillText(`$${state.money}`, 26, 64);
+    if (p.car) {
+      ctx.fillStyle = 'rgba(255,255,255,0.75)';
+      ctx.font = `12px ${FONT}`;
+      const carHp = Math.max(0, Math.round(p.car.health));
+      ctx.fillText(`CAR ${carHp}%`, 118, 64);
+    } else {
+      ctx.fillStyle = 'rgba(255,255,255,0.75)';
+      ctx.font = `12px ${FONT}`;
+      ctx.fillText(`AMMO ${p.ammo}${p.reloading > 0 ? ' ···' : ''}`, 118, 64);
+    }
+
+    // Stars, top-right. They pulse while the trail is going cold.
+    const cooling = state.stars > 0 && state.time - state.lastSeen > 2;
+    for (let i = 0; i < 5; i += 1) {
+      const flash = cooling && Math.sin(state.time * 6) > 0;
+      star(ctx, VIEW.width - 34 - i * 34, 36, 13, i < state.stars, flash);
+    }
+
+    // Objective pill, top-centre.
+    if (state.objective) {
+      const o = state.objective;
+      const dist = Math.round(Math.hypot(p.x - o.x, p.y - o.y) / 10);
+      let text = `${o.label} · ${dist}m`;
+      if (o.timer != null) {
+        const t = Math.max(0, o.timer);
+        const mm = Math.floor(t / 60);
+        const ss = String(Math.floor(t % 60)).padStart(2, '0');
+        text += ` · ${mm}:${ss}`;
+      }
+      ctx.font = `700 14px ${FONT}`;
+      const w = ctx.measureText(text).width + 30;
+      panel(ctx, (VIEW.width - w) / 2, 14, w, 32, 0.78);
+      ctx.fillStyle = o.timer != null && o.timer < 30 ? '#ff8a7a' : '#ffe9a8';
+      ctx.textAlign = 'center';
+      ctx.fillText(text, VIEW.width / 2, 35);
+      ctx.textAlign = 'left';
+
+      // Edge arrow when the target is off-screen.
+      const sx = o.x - state.camera.x;
+      const sy = o.y - state.camera.y;
+      if (sx < 0 || sx > VIEW.width || sy < 0 || sy > VIEW.height) {
+        const cx = Math.max(30, Math.min(VIEW.width - 30, sx));
+        const cy = Math.max(70, Math.min(VIEW.height - 30, sy));
+        const a = Math.atan2(o.y - p.y, o.x - p.x);
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(a);
+        ctx.fillStyle = PALETTE.marker;
+        ctx.beginPath();
+        ctx.moveTo(13, 0);
+        ctx.lineTo(-8, -8);
+        ctx.lineTo(-8, 8);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    // Arrest meter, centre.
+    if (state.arrest > 0.02) {
+      const w = 300;
+      panel(ctx, (VIEW.width - w) / 2, 120, w, 40, 0.8);
+      ctx.fillStyle = '#ff8a7a';
+      ctx.font = `800 13px ${FONT}`;
+      ctx.textAlign = 'center';
+      ctx.fillText('ARREST IN PROGRESS — BREAK LINE OF SIGHT', VIEW.width / 2, 138);
+      ctx.fillStyle = 'rgba(255,255,255,0.22)';
+      ctx.fillRect((VIEW.width - w) / 2 + 14, 146, w - 28, 7);
+      ctx.fillStyle = '#e23b3b';
+      ctx.fillRect((VIEW.width - w) / 2 + 14, 146, (w - 28) * Math.min(1, state.arrest), 7);
+      ctx.textAlign = 'left';
+    }
+
+    drawMinimap(ctx, state);
+    drawDialogue(ctx, state);
+
     ctx.fillStyle = 'rgba(255,255,255,0.5)';
     ctx.font = `12px ${FONT}`;
-    ctx.fillText('E ▸', x + w - 34, y + 70);
+    ctx.textAlign = 'right';
+    ctx.fillText('WASD move · Shift run · F car · Mouse aim · Click shoot · R reload · Esc pause', VIEW.width - 16, VIEW.height - 14);
+    ctx.textAlign = 'left';
   }
-  // Controls reminder, faint, bottom-left.
-  ctx.font = `12px ${FONT}`;
-  ctx.fillStyle = 'rgba(255,255,255,0.55)';
-  ctx.fillText('WASD move · E car / talk · mouse aim · click shoot · Shift run · P pause', 16, view.h - 16);
-}
 
-export function drawOverlay(ctx, sim, screen, view) {
-  const cx = view.w / 2;
-  if (screen === 'paused') {
-    ctx.fillStyle = 'rgba(8,10,18,0.55)';
-    ctx.fillRect(0, 0, view.w, view.h);
-    ctx.font = `800 44px ${FONT}`;
+  // Busted / wasted banner.
+  if (state.respawnTimer > 0 && state.banner) {
+    ctx.fillStyle = state.respawnKind === 'busted' ? 'rgba(20,40,110,0.42)' : 'rgba(110,16,16,0.45)';
+    ctx.fillRect(0, 0, VIEW.width, VIEW.height);
+    ctx.font = `900 84px ${FONT}`;
     ctx.textAlign = 'center';
-    ctx.fillStyle = '#ffffff';
-    ctx.fillText('PAUSED', cx, view.h / 2);
+    ctx.fillStyle = '#fff';
+    ctx.shadowColor = 'rgba(0,0,0,0.6)';
+    ctx.shadowBlur = 18;
+    ctx.fillText(state.banner.text, VIEW.width / 2, VIEW.height / 2 + 10);
+    ctx.shadowBlur = 0;
     ctx.font = `16px ${FONT}`;
-    ctx.fillText('P or Esc to keep playing', cx, view.h / 2 + 34);
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.fillText(state.respawnKind === 'busted' ? 'The fine comes out of your pocket.' : 'The Clínica Sol patches you up — for a fee.', VIEW.width / 2, VIEW.height / 2 + 46);
     ctx.textAlign = 'left';
-    return;
   }
-  if (screen === 'busted' || screen === 'wasted') {
-    const out = sim.lastOutcome ?? { kind: screen, fine: 0 };
-    ctx.fillStyle = screen === 'busted' ? 'rgba(10,16,40,0.62)' : 'rgba(40,8,8,0.62)';
-    ctx.fillRect(0, 0, view.w, view.h);
-    ctx.font = `800 64px ${FONT}`;
+
+  if (screen === 'title') {
+    const grad = ctx.createLinearGradient(0, 0, 0, VIEW.height);
+    grad.addColorStop(0, 'rgba(8,12,24,0.62)');
+    grad.addColorStop(0.55, 'rgba(8,12,24,0.30)');
+    grad.addColorStop(1, 'rgba(8,12,24,0.72)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, VIEW.width, VIEW.height);
     ctx.textAlign = 'center';
-    ctx.fillStyle = screen === 'busted' ? '#7db4ff' : '#ff6b5e';
-    ctx.fillText(screen === 'busted' ? 'BUSTED' : 'WASTED', cx, view.h / 2 - 10);
-    ctx.font = `18px ${FONT}`;
-    ctx.fillStyle = '#ffffff';
-    ctx.fillText(screen === 'busted'
-      ? `The harbour police fine you $${out.fine}. Your heat is gone.`
-      : `The hospital bills you $${out.fine}. The harbour keeps your secrets.`, cx, view.h / 2 + 30);
-    ctx.font = `600 15px ${FONT}`;
+    ctx.font = `900 96px ${FONT}`;
+    ctx.shadowColor = '#ff5fa2';
+    ctx.shadowBlur = 26;
+    ctx.fillStyle = '#ffe9f4';
+    ctx.fillText('NEON HARBOR', VIEW.width / 2, 218);
+    ctx.shadowColor = '#39c2ff';
+    ctx.font = `800 30px ${FONT}`;
+    ctx.fillStyle = '#dff4ff';
+    ctx.fillText('霓 虹 港 湾', VIEW.width / 2, 264);
+    ctx.shadowBlur = 0;
+    ctx.font = `17px ${FONT}`;
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.fillText('One harbour. Three jobs. Every siren in town.', VIEW.width / 2, 316);
+    ctx.font = `600 16px ${FONT}`;
+    ctx.fillStyle = '#ffe9a8';
+    ctx.fillText(ui?.hasSave ? 'Press Enter or click — continue where Rio left off (N for a new game)' : 'Press Enter or click to play', VIEW.width / 2, 386);
+    ctx.font = `14px ${FONT}`;
     ctx.fillStyle = 'rgba(255,255,255,0.75)';
-    ctx.fillText('ENTER — back on the street', cx, view.h / 2 + 62);
+    ctx.fillText('WASD / arrows — move & drive      Shift — run      F — enter / exit car', VIEW.width / 2, 452);
+    ctx.fillText('Mouse — aim      Click / Space — shoot      R — reload      E — talk / advance', VIEW.width / 2, 478);
+    ctx.fillText('Crimes only count when someone sees them. Break line of sight to cool the stars.', VIEW.width / 2, 504);
     ctx.textAlign = 'left';
-    return;
   }
-  // Title.
-  const grad = ctx.createLinearGradient(0, 0, 0, view.h);
-  grad.addColorStop(0, 'rgba(10,12,26,0.72)');
-  grad.addColorStop(0.55, 'rgba(10,12,26,0.25)');
-  grad.addColorStop(1, 'rgba(10,12,26,0.66)');
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, view.w, view.h);
-  ctx.textAlign = 'center';
-  ctx.font = `800 76px ${FONT}`;
-  ctx.shadowColor = '#ff5d8f';
-  ctx.shadowBlur = 26;
-  ctx.fillStyle = '#ffffff';
-  ctx.fillText('NEON HARBOR', cx, 168);
-  ctx.shadowBlur = 0;
-  ctx.font = `600 19px ${FONT}`;
-  ctx.fillStyle = '#a5f3fc';
-  ctx.fillText('Un puerto, tres trabajos, ninguna pregunta.', cx, 204);
-  ctx.font = `16px ${FONT}`;
-  ctx.fillStyle = 'rgba(255,255,255,0.92)';
-  const lines = [
-    'Rio runs errands for Marina, the harbour fixer. Steal, deliver, disappear.',
-    'Crimes only count when somebody sees them — break line of sight to cool down.',
-    '',
-    'WASD / arrows — move and drive      E — car, talk, confirm',
-    'Mouse — aim      Click — shoot      Shift — run      P — pause',
-  ];
-  lines.forEach((line, i) => ctx.fillText(line, cx, 268 + i * 26));
-  ctx.font = `700 21px ${FONT}`;
-  ctx.fillStyle = '#ffd60a';
-  if (sim.hasSave) ctx.fillText('ENTER — new game        C — continue', cx, 452);
-  else ctx.fillText('ENTER — start', cx, 452);
-  ctx.font = `13px ${FONT}`;
-  ctx.fillStyle = 'rgba(255,255,255,0.6)';
-  ctx.fillText('An original harbour-tale. Every car, name and street invented; any resemblance to a certain other city is sunshine.', cx, view.h - 26);
-  ctx.textAlign = 'left';
+
+  if (screen === 'paused') {
+    ctx.fillStyle = 'rgba(8,12,24,0.55)';
+    ctx.fillRect(0, 0, VIEW.width, VIEW.height);
+    ctx.textAlign = 'center';
+    ctx.font = `900 54px ${FONT}`;
+    ctx.fillStyle = '#fff';
+    ctx.fillText('PAUSED', VIEW.width / 2, VIEW.height / 2);
+    ctx.font = `16px ${FONT}`;
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.fillText('Esc or P to resume · N for a new game', VIEW.width / 2, VIEW.height / 2 + 40);
+    ctx.textAlign = 'left';
+  }
 }

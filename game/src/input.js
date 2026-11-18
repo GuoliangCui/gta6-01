@@ -1,83 +1,92 @@
-// Keyboard and pointer input. Held keys give the move axes; one-shot presses (confirm,
-// pause, interact, continue) are queued as bit flags and taken once by the loop, so a
-// press between two frames is never lost and never counted twice. The mouse position is
-// kept in CSS pixels; main.js turns it into a world aim point through the camera.
-
-export const ACTION_CONFIRM = 1;
-export const ACTION_PAUSE = 2;
-export const ACTION_INTERACT = 4;
-export const ACTION_CONTINUE = 8;
-
-const UP = new Set(['ArrowUp', 'KeyW']);
-const DOWN = new Set(['ArrowDown', 'KeyS']);
-const LEFT = new Set(['ArrowLeft', 'KeyA']);
-const RIGHT = new Set(['ArrowRight', 'KeyD']);
-const SPRINT = new Set(['ShiftLeft', 'ShiftRight']);
-const CONFIRM = new Set(['Space', 'Enter']);
-const PAUSE = new Set(['KeyP', 'Escape']);
-const INTERACT = new Set(['KeyE']);
-const CONTINUE = new Set(['KeyC']);
-const GAME_KEYS = new Set([...UP, ...DOWN, ...LEFT, ...RIGHT, ...CONFIRM]);
+// Keyboard and mouse, translated into the simulation's input struct. Held keys are state;
+// presses (enter car, reload, talk, pause, new game) are edges that live for exactly one
+// snapshot. The mouse position is converted from client pixels to world coordinates here,
+// using the camera and the letterboxed view, so the sim only ever sees world space.
+import { EMPTY_INPUT } from './sim.js';
 
 export function createInput(canvas) {
   const held = new Set();
-  const mouse = { x: 0, y: 0, down: false, seen: false };
-  let queued = 0;
+  const edges = new Set();
+  let mouseClient = null;
+  let mouseDown = false;
 
-  window.addEventListener('keydown', (event) => {
-    if (GAME_KEYS.has(event.code)) event.preventDefault();
-    if (event.repeat) return;
-    held.add(event.code);
-    if (CONFIRM.has(event.code)) queued |= ACTION_CONFIRM;
-    if (PAUSE.has(event.code)) queued |= ACTION_PAUSE;
-    if (INTERACT.has(event.code)) queued |= ACTION_INTERACT;
-    if (CONTINUE.has(event.code)) queued |= ACTION_CONTINUE;
-  });
-  window.addEventListener('keyup', (event) => {
-    held.delete(event.code);
-  });
-  window.addEventListener('blur', () => {
-    held.clear();
-    mouse.down = false;
-  });
-  canvas.addEventListener('mousemove', (event) => {
-    mouse.x = event.clientX;
-    mouse.y = event.clientY;
-    mouse.seen = true;
-  });
-  canvas.addEventListener('mousedown', (event) => {
-    mouse.down = true;
-    mouse.x = event.clientX;
-    mouse.y = event.clientY;
-    mouse.seen = true;
-    queued |= ACTION_CONFIRM;
-  });
-  window.addEventListener('mouseup', () => {
-    mouse.down = false;
-  });
+  const EDGE_KEYS = {
+    KeyF: 'interact', KeyE: 'interact',
+    Enter: 'confirm', Space: 'confirm',
+    KeyR: 'reload',
+    Escape: 'pause', KeyP: 'pause',
+    KeyN: 'newGame',
+  };
 
-  function anyIn(set) {
-    for (const code of set) if (held.has(code)) return true;
-    return false;
-  }
+  window.addEventListener('keydown', (e) => {
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
+    if (!e.repeat) {
+      held.add(e.code);
+      const edge = EDGE_KEYS[e.code];
+      if (edge) edges.add(edge);
+      edges.add('any');
+    }
+  });
+  window.addEventListener('keyup', (e) => held.delete(e.code));
+  window.addEventListener('blur', () => { held.clear(); mouseDown = false; });
+
+  canvas.addEventListener('mousemove', (e) => { mouseClient = { x: e.clientX, y: e.clientY }; });
+  canvas.addEventListener('mousedown', (e) => {
+    mouseClient = { x: e.clientX, y: e.clientY };
+    mouseDown = true;
+    edges.add('confirm');
+    edges.add('any');
+  });
+  window.addEventListener('mouseup', () => { mouseDown = false; });
+  canvas.addEventListener('touchstart', (e) => {
+    const t = e.touches[0];
+    if (t) mouseClient = { x: t.clientX, y: e.clientY };
+    edges.add('any');
+  }, { passive: true });
+
+  const down = (...codes) => codes.some((c) => held.has(c));
 
   return {
-    mouse,
-    /** Move axes, each -1, 0 or 1: y grows downward, so up is -1. */
-    axes() {
-      return {
-        mx: (anyIn(RIGHT) ? 1 : 0) - (anyIn(LEFT) ? 1 : 0),
-        my: (anyIn(DOWN) ? 1 : 0) - (anyIn(UP) ? 1 : 0),
+    /**
+     * Build this frame's inputs. `sim` goes to stepSim; `ui` carries the one-frame edges
+     * the shell itself consumes (pause, new game, "pressed anything").
+     */
+    snapshot(state, view) {
+      const p = state.player;
+      let aimX = p.x + Math.cos(p.angle) * 120;
+      let aimY = p.y + Math.sin(p.angle) * 120;
+      let aimActive = false;
+      if (mouseClient && view) {
+        const rect = canvas.getBoundingClientRect();
+        const vx = (mouseClient.x - rect.left - view.ox) / view.scale;
+        const vy = (mouseClient.y - rect.top - view.oy) / view.scale;
+        aimX = state.camera.x + vx;
+        aimY = state.camera.y + vy;
+        aimActive = true;
+      }
+      const sim = {
+        ...EMPTY_INPUT,
+        up: down('KeyW', 'ArrowUp'),
+        down: down('KeyS', 'ArrowDown'),
+        left: down('KeyA', 'ArrowLeft'),
+        right: down('KeyD', 'ArrowRight'),
+        sprint: down('ShiftLeft', 'ShiftRight'),
+        shoot: mouseDown || held.has('Space'),
+        interactPressed: edges.has('interact'),
+        confirmPressed: edges.has('confirm'),
+        reloadPressed: edges.has('reload'),
+        aimX,
+        aimY,
+        aimActive,
       };
-    },
-    sprint() {
-      return anyIn(SPRINT);
-    },
-    /** Take the queued one-shot actions; each press is reported exactly once. */
-    takeActions() {
-      const actions = queued;
-      queued = 0;
-      return actions;
+      const ui = {
+        pause: edges.has('pause'),
+        newGame: edges.has('newGame'),
+        any: edges.has('any'),
+        confirm: edges.has('confirm'),
+      };
+      edges.clear();
+      return { sim, ui };
     },
   };
 }

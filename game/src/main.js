@@ -1,155 +1,144 @@
-// Boot and the one loop. The simulation advances in fixed steps behind an accumulator;
-// input is snapshotted per step (one-shot presses land on the first step of their frame);
-// the renderer paints the world, the HUD and whichever screen is up — title, play, paused,
-// busted, wasted. Sound is fed the steps' events once per frame.
+// Boot and the one loop. The world advances in fixed 1/60 s steps (several in a slow
+// frame, none in a fast one); the renderer paints what is there. Screens: title (the city
+// idles in attract mode behind the logo), play, paused. Sound is synthesized — the audio
+// module wakes on the first gesture, and the loop feeds it the step's events.
 //
-// ?seed=N fixes the city and its luck. ?shot=walk|drive|chase|mission (with &seed=N)
-// stages that scene instead of running the loop, paints it twice and sets
-// window.__shotReady for a screenshot.
+// ?seed=N fixes the city layout. ?shot=walk|drive|chase|mission (with &seed=N) stages that
+// scene through the real simulation instead of running the loop, paints it twice and sets
+// window.__shotReady for the screenshot.
 import { STEP } from './config.js';
-import { createSim, resolveOutcome, stepSim } from './sim.js';
-import { ACTION_CONFIRM, ACTION_CONTINUE, ACTION_INTERACT, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_BUSTED, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WASTED } from './render.js';
-import { createAudio } from './audio.js';
-import { clearSave, loadSave, writeSave } from './save.js';
+import { createSim, stepSim } from './sim.js';
+import { createInput } from './input.js';
+import { createRenderer } from './render.js';
+import { drawHud } from './hud.js';
 import { stageShot } from './shots.js';
+import { createAudio } from './audio.js';
+import { loadSave, clearSave } from './save.js';
 
 const MAX_FRAME = 0.25;
 
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
 const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+const seed = Number.isInteger(seedParam) ? seedParam : (Date.now() % 2147483646) + 1;
 
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
 const renderer = createRenderer(canvas);
+const ctx = renderer.ctx;
+const audio = createAudio();
 
-function announce(message) {
-  status.textContent = message;
+function fitCanvas() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.round(window.innerWidth * dpr);
+  canvas.height = Math.round(window.innerHeight * dpr);
+}
+window.addEventListener('resize', fitCanvas);
+fitCanvas();
+
+function paint(state, screen, ui) {
+  const view = renderer.draw(state);
+  ctx.setTransform(view.scale, 0, 0, view.scale, view.ox, view.oy);
+  drawHud(ctx, state, screen, ui);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  return view;
 }
 
 function runShot(name) {
-  const sim = createSim(seed, null);
-  stageShot(name, sim);
+  const state = stageShot(name, seed);
   let painted = 0;
-  function paint() {
-    renderer.draw(sim, SCREEN_PLAY);
+  function frame() {
+    paint(state, 'play', { hasSave: false });
     painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
+    if (painted < 2) requestAnimationFrame(frame);
     else window.__shotReady = true;
   }
-  requestAnimationFrame(paint);
+  requestAnimationFrame(frame);
 }
 
 function runGame() {
   const input = createInput(canvas);
-  const audio = createAudio();
-  const saved = loadSave();
-  let sim = createSim(seed, saved);
-  sim.hasSave = Boolean(saved);
-  let screen = SCREEN_TITLE;
+  let save = loadSave();
+  let state = createSim(seed, save);
+  state.flags.mode = 'title';
+  let screen = 'title';
+  let view = null;
   let accumulator = 0;
   let last = performance.now();
-  let savedMoney = sim.money;
-  let savedIndex = sim.missions.index;
+  let wasRespawning = false;
+  status.textContent = 'Neon Harbor. Press Enter or click to play.';
 
-  function startPlay(fresh) {
-    if (fresh) {
-      clearSave();
-      sim = createSim(seed, null);
-      sim.hasSave = false;
-      savedMoney = 0;
-      savedIndex = 0;
-    }
-    screen = SCREEN_PLAY;
-    accumulator = 0;
-    announce(`Neon Harbor. Cash $${sim.money}. ${sim.missions.objective}`);
+  function newGame() {
+    clearSave();
+    save = null;
+    state = createSim((Date.now() % 2147483646) + 1, null);
+    state.flags.mode = 'play';
+    screen = 'play';
+    audio.stopPad();
+    status.textContent = 'Neon Harbor. New game.';
   }
 
-  function snapshot(actions, firstStep) {
-    const { mx, my } = input.axes();
-    const aim = renderer.toWorld(input.mouse.x, input.mouse.y);
-    return {
-      mx,
-      my,
-      sprint: input.sprint(),
-      interact: firstStep && (actions & ACTION_INTERACT) !== 0,
-      shoot: input.mouse.down,
-      aiming: input.mouse.seen,
-      aimX: aim.x,
-      aimY: aim.y,
-      confirm: firstStep && (actions & ACTION_CONFIRM) !== 0,
-    };
+  function startPlay() {
+    state.flags.mode = 'play';
+    screen = 'play';
+    audio.stopPad();
+    status.textContent = 'Neon Harbor. Meet Marina by the harbour.';
+  }
+
+  function playSounds() {
+    for (const ev of state.events) {
+      if (ev.type === 'shotFired') audio.shot(ev.byPlayer);
+      else if (ev.type === 'paid') audio.cash();
+      else if (ev.type === 'enterCar' || ev.type === 'exitCar') audio.door();
+      else if (ev.type === 'crash') audio.crash();
+    }
+    const respawning = state.respawnTimer > 0;
+    if (respawning && !wasRespawning) {
+      if (state.respawnKind === 'busted') audio.busted();
+      else audio.wasted();
+    }
+    wasRespawning = respawning;
   }
 
   function frame(now) {
     requestAnimationFrame(frame);
     accumulator += Math.min((now - last) / 1000, MAX_FRAME);
     last = now;
-    const actions = input.takeActions();
-    if (actions) audio.unlock();
+    const { sim, ui } = input.snapshot(state, view);
+    if (ui.any) audio.unlock();
 
-    if (screen === SCREEN_TITLE) {
-      if (actions & ACTION_CONTINUE && sim.hasSave) startPlay(false);
-      else if (actions & ACTION_CONFIRM) startPlay(sim.hasSave);
-      while (accumulator >= STEP) {
-        stepSim(sim, STEP, snapshot(0, false));
-        accumulator -= STEP;
-      }
-    } else if (screen === SCREEN_PLAY) {
-      if (actions & ACTION_PAUSE) {
-        screen = SCREEN_PAUSED;
-        announce('Paused.');
-      }
-      const frameEvents = [];
-      let first = true;
-      while (accumulator >= STEP && screen === SCREEN_PLAY) {
-        stepSim(sim, STEP, snapshot(actions, first));
-        first = false;
-        frameEvents.push(...sim.events);
-        accumulator -= STEP;
-        if (sim.outcome) {
-          const kind = sim.outcome;
-          const fine = resolveOutcome(sim);
-          sim.lastOutcome = { kind, fine };
-          screen = kind === 'busted' ? SCREEN_BUSTED : SCREEN_WASTED;
-          announce(kind === 'busted' ? `Busted. Fined $${fine}.` : `Wasted. Hospital bill $${fine}.`);
-        }
-      }
-      audio.handleEvents(frameEvents);
-      if (sim.money !== savedMoney || sim.missions.index !== savedIndex) {
-        savedMoney = sim.money;
-        savedIndex = sim.missions.index;
-        writeSave(sim);
-      }
-    } else if (screen === SCREEN_PAUSED) {
-      if (actions & (ACTION_PAUSE | ACTION_CONFIRM)) {
-        screen = SCREEN_PLAY;
-        announce('Playing.');
-      }
-      accumulator = 0;
+    if (screen === 'title') {
+      if (ui.newGame) { newGame(); accumulator = 0; }
+      else if (ui.confirm || ui.any) startPlay();
+    } else if (screen === 'play' && ui.pause) {
+      screen = 'paused';
+      status.textContent = 'Paused.';
+    } else if (screen === 'paused') {
+      if (ui.newGame) { newGame(); accumulator = 0; }
+      else if (ui.pause || ui.confirm) { screen = 'play'; status.textContent = 'Playing.'; }
+    }
+
+    if (screen === 'title') {
+      while (accumulator >= STEP) { stepSim(state, sim, STEP); accumulator -= STEP; }
+    } else if (screen === 'play') {
+      let stepped = false;
+      while (accumulator >= STEP) { stepSim(state, sim, STEP); accumulator -= STEP; stepped = true; }
+      if (stepped) playSounds();
     } else {
-      // Busted or wasted: the panel waits for a confirm.
-      if (actions & ACTION_CONFIRM) {
-        screen = SCREEN_PLAY;
-        announce('Back on the street.');
-      }
       accumulator = 0;
     }
-    audio.update(sim);
-    renderer.draw(sim, screen);
+    audio.update(state);
+    view = paint(state, screen, { hasSave: !!save });
   }
 
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
+    if (document.hidden && screen === 'play') {
+      screen = 'paused';
+      status.textContent = 'Paused.';
     }
   });
-  canvas.addEventListener('mousedown', () => audio.unlock());
 
-  announce('Neon Harbor. Press Enter to start.');
+  audio.startPad();
   requestAnimationFrame(frame);
 }
 

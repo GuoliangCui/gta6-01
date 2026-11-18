@@ -1,103 +1,121 @@
-// Cars and their arcade physics. One model serves the player's ride, ambient traffic and
-// police interceptors; only the driver (a control object) and the top speed differ. A car
-// is a position, a heading and a forward speed — collisions treat it as a circle, which
-// keeps the harbour's tight corners forgiving.
-import {
-  CAR_ACCEL, CAR_BRAKE, CAR_DRAG, CAR_REVERSE, CAR_TOP_COP, CAR_TOP_SPORT,
-  CAR_TOP_SPEED, CAR_TURN,
-} from './config.js';
+// Cars: one arcade physics step shared by the player, the police and (in kinematic form) the
+// traffic. A car is a circle for collision — radius from its width — which keeps building and
+// car-to-car resolution cheap and stable at 60 steps a second. Hard knocks cost health; a car
+// at zero health is a wreck: it will not start, and it smokes.
+import { CAR_TYPES } from './config.js';
 import { collideCircle } from './world.js';
 
-/** Step results, as bit flags so the simulation can react (sound, damage, crime). */
-export const CAR_HIT_WORLD = 1;
-export const CAR_HIT_HARD = 2;
-
-const PAINTS = ['#e74c3c', '#f39c12', '#ecf0f1', '#3498db', '#9b59b6', '#1abc9c', '#e67e22', '#fd79a8', '#95a5a6'];
-const SPORT_PAINTS = ['#ff2d78', '#ffb400', '#00e5ff', '#7cff00'];
-
-/** Create a car. kind: 'car' | 'sport' | 'cop' | 'taxi'. Parked cars have no driver. */
-export function createCar(rng, x, y, angle, kind, parked) {
+export function createCar(type, x, y, angle, kind, colour) {
+  const spec = CAR_TYPES[type];
   return {
-    id: 0,
+    type,
+    kind, // 'traffic' | 'parked' | 'police' | 'mission'
     x, y, angle,
+    vx: 0, vy: 0,
     speed: 0,
-    kind,
-    topSpeed: kind === 'sport' ? CAR_TOP_SPORT : kind === 'cop' ? CAR_TOP_COP : CAR_TOP_SPEED,
-    color: kind === 'cop' ? '#f5f6fa' : kind === 'sport' ? rng.pick(SPORT_PAINTS) : kind === 'taxi' ? '#f7b731' : rng.pick(PAINTS),
+    w: spec.w,
+    h: spec.h,
+    radius: 17,
+    maxSpeed: spec.maxSpeed,
+    accel: spec.accel,
+    colour: colour ?? spec.colour,
     health: 100,
-    parked: Boolean(parked),
-    locked: parked ? rng.chance(0.3) : false,
-    driver: null,
-    cruise: rng.range(190, 265),
-    wx: x,
-    wy: y,
+    driver: null, // null | 'player' | 'ai'
+    cruise: 0,
     stuck: 0,
+    lastImpact: 0,
+    flash: 0, // police light phase
   };
 }
 
+const REVERSE_MAX = 0.34;
+
 /**
- * Advance one car one step. control is {throttle: -1..1, steer: -1..1}. The car slows
- * itself with drag, steers harder the faster it goes (up to a point), and reports hard
- * impacts so the caller can hurt the occupants and dent the bodywork.
+ * Advance one car with {throttle: -1..1, steer: -1..1}. Returns the impact speed of the
+ * hardest knock this step (0 when it rolled free), so callers can charge damage and noise.
  */
-export function stepCar(world, car, dt, control) {
-  const before = car.speed;
-  if (control.throttle > 0) {
-    car.speed += CAR_ACCEL * control.throttle * dt * (1 - Math.max(0, car.speed) / (car.topSpeed * 1.25));
-  } else if (control.throttle < 0) {
-    if (car.speed > 12) car.speed -= CAR_BRAKE * dt;
-    else car.speed = Math.max(-CAR_REVERSE, car.speed + CAR_ACCEL * control.throttle * dt);
+export function stepCarPhysics(world, car, input, dt) {
+  if (car.health <= 0) {
+    car.speed *= Math.max(0, 1 - 3 * dt);
+  } else if (input.throttle > 0) {
+    car.speed += car.accel * input.throttle * dt;
+  } else if (input.throttle < 0) {
+    car.speed += (car.speed > 12 ? car.accel * 2.1 : car.accel * 0.8) * input.throttle * dt;
   }
-  car.speed -= car.speed * CAR_DRAG * dt;
-  if (Math.abs(car.speed) < 2 && control.throttle === 0) car.speed = 0;
-  const grip = Math.min(1, Math.abs(car.speed) / 130);
-  car.angle += control.steer * CAR_TURN * grip * dt * (car.speed < 0 ? -1 : 1);
-  car.x += Math.cos(car.angle) * car.speed * dt;
-  car.y += Math.sin(car.angle) * car.speed * dt;
-  let events = 0;
-  if (collideCircle(world, car, 21)) {
-    events |= CAR_HIT_WORLD;
-    if (Math.abs(before) > 190) events |= CAR_HIT_HARD;
-    car.speed *= -0.22;
+  car.speed -= car.speed * 0.32 * dt; // drag and rolling resistance
+  const top = car.health <= 0 ? 0 : car.maxSpeed;
+  car.speed = Math.max(-top * REVERSE_MAX, Math.min(top, car.speed));
+  if (Math.abs(car.speed) < 2 && input.throttle === 0) car.speed = 0;
+
+  const turnAuthority = Math.min(1, Math.abs(car.speed) / 130);
+  car.angle += input.steer * 2.05 * turnAuthority * dt * (car.speed < 0 ? -1 : 1);
+
+  car.vx = Math.cos(car.angle) * car.speed;
+  car.vy = Math.sin(car.angle) * car.speed;
+  car.x += car.vx * dt;
+  car.y += car.vy * dt;
+
+  const impact = collideCircle(world, car, car.radius);
+  car.lastImpact = impact;
+  if (impact > 130) {
+    car.health = Math.max(0, car.health - (impact - 130) / 11);
+    car.speed *= 0.42;
+    car.vx = Math.cos(car.angle) * car.speed;
+    car.vy = Math.sin(car.angle) * car.speed;
+  } else if (impact > 0) {
+    car.speed *= 0.82;
   }
-  return events;
+  car.flash += dt * 9;
+  return impact;
 }
 
 /**
- * Two cars meeting: push them apart, and trade momentum only on a real impact — the
- * approach speed along the line of centres. Resting contact (a police car leaning on
- * the player's door) moves nobody's speedometer, so a floored throttle still pulls
- * away. Returns the approach speed, 0 when there was no impact.
+ * Resolve overlaps between every pair of cars. Fills `hits` with {a, b, closing} for pairs
+ * that met hard enough to matter; callers decide what a crash means (damage, noise, blame).
  */
-export function collideCars(a, b) {
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const d = Math.hypot(dx, dy);
-  if (d >= 40 || d < 0.001) return 0;
-  const nx = dx / d;
-  const ny = dy / d;
-  const push = (40 - d) / 2;
-  a.x -= nx * push;
-  a.y -= ny * push;
-  b.x += nx * push;
-  b.y += ny * push;
-  const avx = Math.cos(a.angle) * a.speed;
-  const avy = Math.sin(a.angle) * a.speed;
-  const bvx = Math.cos(b.angle) * b.speed;
-  const bvy = Math.sin(b.angle) * b.speed;
-  const an = avx * nx + avy * ny;
-  const bn = bvx * nx + bvy * ny;
-  const approach = an - bn;
-  if (approach <= 0) return 0;
-  // Exchange the normal velocity components, damped; tangents carry through. A
-  // head-on now bounces both cars back instead of grinding them to a standstill.
-  const anAfter = bn * 0.85;
-  const bnAfter = an * 0.85;
-  const aVx = avx - an * nx + anAfter * nx;
-  const aVy = avy - an * ny + anAfter * ny;
-  const bVx = bvx - bn * nx + bnAfter * nx;
-  const bVy = bvy - bn * ny + bnAfter * ny;
-  a.speed = aVx * Math.cos(a.angle) + aVy * Math.sin(a.angle);
-  b.speed = bVx * Math.cos(b.angle) + bVy * Math.sin(b.angle);
-  return approach;
+export function collideCars(cars, hits) {
+  hits.length = 0;
+  for (let i = 0; i < cars.length; i += 1) {
+    const a = cars[i];
+    for (let j = i + 1; j < cars.length; j += 1) {
+      const b = cars[j];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const min = a.radius + b.radius;
+      const d2 = dx * dx + dy * dy;
+      if (d2 >= min * min || d2 === 0) continue;
+      const d = Math.sqrt(d2);
+      const nx = dx / d;
+      const ny = dy / d;
+      const push = (min - d) / 2;
+      a.x -= nx * push;
+      a.y -= ny * push;
+      b.x += nx * push;
+      b.y += ny * push;
+      const closing = (a.vx - b.vx) * nx + (a.vy - b.vy) * ny;
+      if (closing > 0) {
+        // Trade momentum along the line of impact, then bleed speed: a shunt, not a bounce.
+        const impulse = closing * 0.62;
+        a.vx -= nx * impulse;
+        a.vy -= ny * impulse;
+        b.vx += nx * impulse;
+        b.vy += ny * impulse;
+        a.speed = a.vx * Math.cos(a.angle) + a.vy * Math.sin(a.angle);
+        b.speed = b.vx * Math.cos(b.angle) + b.vy * Math.sin(b.angle);
+        if (closing > 95) {
+          const dmg = (closing - 95) / 13;
+          a.health = Math.max(0, a.health - dmg);
+          b.health = Math.max(0, b.health - dmg);
+          hits.push({ a, b, closing });
+        }
+      }
+    }
+  }
+  return hits;
+}
+
+/** The spot a driver steps out to: beside the car, clear of its body. */
+export function exitSpot(car) {
+  const side = car.angle - Math.PI / 2;
+  return { x: car.x + Math.cos(side) * (car.radius + 16), y: car.y + Math.sin(side) * (car.radius + 16) };
 }
