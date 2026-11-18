@@ -1,126 +1,137 @@
-// The screenshot scenes behind ?shot=walk|drive|chase|mission&seed=N. Each one
-// builds a fresh world from the seed and plays the real simulation forward with
-// a scripted driver, so the frame is an honest moment of the game — traffic,
-// police and missions behaving exactly as they do in play — and the same seed
-// always stages the same frame.
+// The screenshot scenes behind ?shot=walk|drive|chase|mission. Each one stages a real
+// moment of the game — the player is placed, the simulation runs forward on scripted
+// inputs for a few seconds, and the frame the renderer then paints is exactly what a
+// player would see: the city on foot, a drive through traffic, a three-star chase, and
+// a delivery in progress with its countdown and dialogue. Same seed, same frame.
 import { STEP } from './config.js';
-import { laneCenterX } from './city.js';
-import { angleDelta, clamp, distance } from './geom.js';
-import { addWanted } from './police.js';
-import { startBriefing } from './missions.js';
-import { advanceDialogue, stepGame } from './sim.js';
+import { stepSim } from './sim.js';
+import { PLACE_CAFE } from './world.js';
 
-const IDLE = { moveX: 0, moveY: 0, firing: false, interact: false, sprint: false, throttle: 0, steer: 0 };
-
-function step(state, input, frames) {
-  for (let i = 0; i < frames; i += 1) stepGame(state, { ...IDLE, ...input }, STEP);
+function baseInput() {
+  return { mx: 0, my: 0, sprint: false, interact: false, shoot: false, aiming: false, aimX: 0, aimY: 0, confirm: false };
 }
 
-/** A simple driver: steer at a world point, hold a cruise speed. */
-function driveToward(state, targetX, targetY, cruise, frames) {
-  const car = state.player.car;
-  for (let i = 0; i < frames; i += 1) {
-    const want = Math.atan2(targetY - car.y, targetX - car.x);
-    const steer = clamp(angleDelta(car.angle, want) * 1.9, -1, 1);
-    const throttle = car.speed < cruise ? 1 : 0;
-    stepGame(state, { ...IDLE, throttle, steer }, STEP);
+function run(sim, seconds, control) {
+  const steps = Math.round(seconds / STEP);
+  for (let i = 0; i < steps; i += 1) stepSim(sim, STEP, control(sim));
+}
+
+function walkToward(sim, tx, ty, sprint = false) {
+  const input = baseInput();
+  const dx = tx - sim.player.x;
+  const dy = ty - sim.player.y;
+  const d = Math.hypot(dx, dy) || 1;
+  input.mx = dx / d;
+  input.my = dy / d;
+  input.sprint = sprint;
+  return input;
+}
+
+const unstick = { lowTime: 0, reverseLeft: 0 };
+
+function driveToward(sim, tx, ty) {
+  const input = baseInput();
+  const car = sim.player.car;
+  if (!car) return input;
+  const wanted = Math.atan2(ty - car.y, tx - car.x);
+  let diff = wanted - car.angle;
+  while (diff > Math.PI) diff -= Math.PI * 2;
+  while (diff < -Math.PI) diff += Math.PI * 2;
+  input.mx = Math.max(-1, Math.min(1, diff * 2.2));
+  input.my = Math.abs(diff) > 1.9 ? 0.4 : -1;
+  // Brake for corners: a sharp heading change close ahead means slow down.
+  if (Math.hypot(tx - car.x, ty - car.y) < 280 && Math.abs(diff) > 0.5 && Math.abs(car.speed) > 250) input.my = 0.55;
+  // Wedged against a wall at walking pace: reverse out with opposite lock.
+  if (Math.abs(car.speed) < 28 && unstick.reverseLeft <= 0) unstick.lowTime += STEP;
+  else if (unstick.reverseLeft <= 0) unstick.lowTime = 0;
+  if (unstick.lowTime > 1.2) { unstick.reverseLeft = 0.65; unstick.lowTime = 0; }
+  if (unstick.reverseLeft > 0) {
+    unstick.reverseLeft -= STEP;
+    input.my = 0.85;
+    input.mx = -input.mx;
   }
+  return input;
 }
 
-/** Put the player behind the wheel of a car, wherever it currently sits. */
-function putPlayerInCar(state, car) {
-  car.driver = 'player';
-  state.player.car = car;
-  state.player.x = car.x;
-  state.player.y = car.y;
-}
-
-/** The nearest parked car to a point (the staging crew is not picky). */
-function nearestParkedCar(state, x, y) {
-  let best = null;
-  let bestD = Infinity;
-  for (const car of state.cars) {
-    if (car.kind !== 'parked' || car.missionTarget) continue;
-    const d = distance(car.x, car.y, x, y);
-    if (d < bestD) { bestD = d; best = car; }
-  }
-  return best;
-}
-
-/** walk: Juno crosses the plaza quarter on foot, traffic rolling past. */
-function stageWalk(state) {
-  const player = state.player;
-  player.x = 1330;
-  player.y = 640;
-  step(state, { moveX: 1, moveY: -0.35, sprint: false }, 150);
-  step(state, { moveX: 0.4, moveY: -1, sprint: false }, 90);
-}
-
-/** drive: southbound down the long avenue, the harbour opening up ahead. */
-function stageDrive(state) {
-  const car = nearestParkedCar(state, 700, 500);
-  putPlayerInCar(state, car);
-  car.x = laneCenterX(2, 1);
-  car.y = 330;
-  car.angle = Math.PI / 2;
-  car.speed = 190;
-  state.player.x = car.x;
-  state.player.y = car.y;
-  driveToward(state, laneCenterX(2, 1), 1560, 235, 400);
-}
-
-/** chase: four stars, a fast car, and the NHPD arriving from every side street. */
-function stageChase(state) {
-  const car = state.cars.find((c) => c.missionTarget);
-  putPlayerInCar(state, car);
-  car.x = laneCenterX(3, -1);
-  car.y = 980;
-  car.angle = -Math.PI / 2;
-  car.speed = 250;
-  state.player.x = car.x;
-  state.player.y = car.y;
-  addWanted(state, 4);
-  // Two interceptors start close enough to be in frame; the rest roll in live.
-  for (const [dx, dy] of [[-150, 300], [170, 380]]) {
-    const cop = state.spawnPoliceCar();
-    if (cop) {
-      cop.x = car.x + dx;
-      cop.y = car.y + dy;
-      cop.angle = -Math.PI / 2;
-      cop.speed = 240;
+function waypointDriver(points) {
+  let at = 0;
+  return (sim) => {
+    const car = sim.player.car;
+    if (!car) return baseInput();
+    let [tx, ty] = points[Math.min(at, points.length - 1)];
+    if (Math.hypot(tx - car.x, ty - car.y) < 90 && at < points.length - 1) {
+      at += 1;
+      [tx, ty] = points[at];
     }
-  }
-  driveToward(state, laneCenterX(3, -1), 120, 300, 215);
+    return driveToward(sim, tx, ty);
+  };
 }
 
-/** mission: the case is in hand, the diner clock is running, the city is awake. */
-function stageMission(state) {
-  const player = state.player;
-  const cafe = state.city.pois.cafe;
-  player.x = cafe.x;
-  player.y = cafe.y;
-  startBriefing(state);
-  while (state.dialogue) advanceDialogue(state);
-  // Collect the case from the pier.
-  const pier = state.city.pois.pier;
-  player.x = pier.x;
-  player.y = pier.y;
-  step(state, {}, 2);
-  // Then drive the delivery: north up the avenue with the timer on the HUD.
-  const car = nearestParkedCar(state, pier.x, pier.y - 160);
-  putPlayerInCar(state, car);
-  car.x = laneCenterX(2, -1);
-  car.y = 1330;
-  car.angle = -Math.PI / 2;
-  car.speed = 210;
-  player.x = car.x;
-  player.y = car.y;
-  driveToward(state, laneCenterX(2, -1), 300, 250, 170);
+function enterHarbourCar(sim) {
+  sim.player.x = 972;
+  sim.player.y = 2274;
+  let step = 0;
+  run(sim, 0.1, () => {
+    const input = baseInput();
+    input.interact = step === 2;
+    step += 1;
+    return input;
+  });
 }
 
-const SCENES = { walk: stageWalk, drive: stageDrive, chase: stageChase, mission: stageMission };
+const SCENES = {
+  walk(sim) {
+    sim.player.x = 1150;
+    sim.player.y = 985;
+    const loop = [[1345, 985], [1345, 1160], [1150, 1160], [1150, 985]];
+    let at = 0;
+    run(sim, 7, () => {
+      const [tx, ty] = loop[at % loop.length];
+      if (Math.hypot(tx - sim.player.x, ty - sim.player.y) < 30) at += 1;
+      return walkToward(sim, tx, ty);
+    });
+  },
+  drive(sim) {
+    enterHarbourCar(sim);
+    // The calm-drive scene starts clean: whatever the harbour thought it saw, forget it.
+    sim.wanted.stars = 0;
+    sim.cars = sim.cars.filter((car) => car.kind !== 'cop');
+    run(sim, 9, waypointDriver([[1560, 2332], [2360, 2332], [2880, 2332], [2940, 1960]]));
+    if (sim.wanted.stars > 0) {
+      sim.wanted.stars = 0;
+      sim.cars = sim.cars.filter((car) => car.kind !== 'cop');
+    }
+  },
+  chase(sim) {
+    enterHarbourCar(sim);
+    const drive = waypointDriver([[1560, 2332], [2100, 2332], [2100, 1560], [2100, 640]]);
+    run(sim, 2.2, () => drive(sim));
+    sim.wanted.stars = 3;
+    run(sim, 8, () => drive(sim));
+  },
+  mission(sim) {
+    const state = sim.missions;
+    state.index = 0;
+    state.phase = 'active';
+    state.stage = 'deliver';
+    state.hasPackage = true;
+    state.timer = 118;
+    state.marker = sim.world.places[PLACE_CAFE];
+    state.objective = 'Deliver the package to Café Sol — fast';
+    sim.player.x = 880;
+    sim.player.y = 2562;
+    run(sim, 2.4, () => walkToward(sim, 880, 2410));
+    // The phone call lands in the final frame, not before it.
+    state.dialogue = {
+      speaker: 'Marina · phone',
+      lines: ['You have it? Good. Café Sol, and do not stop for anyone.'],
+      at: 0.4,
+      index: 0,
+    };
+  },
+};
 
-/** Stage the named scene on a fresh world; unknown names fall back to walk. */
-export function stageShot(name, state) {
-  (SCENES[name] ?? stageWalk)(state);
+/** Stage the named scene on a fresh simulation (any other name is the walk scene). */
+export function stageShot(name, sim) {
+  (SCENES[name] ?? SCENES.walk)(sim);
 }

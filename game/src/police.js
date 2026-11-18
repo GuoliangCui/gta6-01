@@ -1,190 +1,145 @@
-// The wanted system and the police response: stars rise with witnessed crime and
-// cool off while the player stays unseen. Police cars hunt in numbers set by the
-// star level, reinforcements roll in quickly, officers get out to make arrests,
-// and at three stars and up those officers shoot.
-import { CAR, POLICE_BY_STAR, WANTED } from './config.js';
-import { angleDelta, clamp, distance, turnToward } from './geom.js';
+// The wanted system and the harbour police. The law here is literal: a crime only raises
+// stars when somebody sees it — an officer in range with line of sight, or a pedestrian
+// close enough to tell the tale. Pursuit is fast and layered: interceptors spawn on the
+// avenues around the player, hunt predicted positions, and an arrest completes when an
+// officer keeps the player pinned and slow.
+import {
+  BUST_TIME, COPS_PER_STAR, COP_SPAWN_INTERVAL, EVADE_TIME, WITNESS_COP_RANGE, WITNESS_PED_RANGE,
+} from './config.js';
+import { isRoad, lineOfSight } from './world.js';
+import { createCar, stepCar } from './vehicles.js';
 
-/** How far the police can spot the player, and how close an officer must be to arrest. */
-const SIGHT_RANGE = 580;
-const ARREST_RANGE = 46;
-const CAR_ARREST_RANGE = 78;
-/** Seconds between reinforcement checks: the next car is never far behind. */
-const REINFORCE_EVERY = 0.55;
+/** Minimum stars each crime earns when witnessed. */
+const CRIME_STARS = { theft: 1, gunfire: 1, assault: 2, copcrash: 2, kill: 3, copkill: 4 };
 
-export function createPoliceState() {
-  return { spawnTimer: 0.3, officerTimer: 0 };
+export function createWanted() {
+  return { stars: 0, evade: 0, bust: 0, spawnTimer: 0, gunCool: 0, seen: false };
 }
 
-/** Raise the wanted level (capped), reset the cooling-off clock, hurry the response. */
-export function addWanted(state, points) {
-  if (points <= 0) return;
-  const before = state.wanted;
-  state.wanted = Math.min(WANTED.max, state.wanted + points);
-  state.hideTimer = 0;
-  if (state.wanted > before) {
-    // New stars bring an immediate response: the next car rolls almost at once.
-    state.police.spawnTimer = Math.min(state.police.spawnTimer, 0.35);
+/** Would anyone report a crime committed at (x, y) right now? */
+export function witnessed(world, cars, peds, x, y) {
+  for (const car of cars) {
+    if (car.kind !== 'cop' || car.driver !== 'cop') continue;
+    if (Math.hypot(car.x - x, car.y - y) < WITNESS_COP_RANGE && lineOfSight(world, car.x, car.y, x, y)) return true;
   }
-}
-
-/** Police cars still able to chase (not wrecked, not leaving, not stolen). */
-export function activePoliceCars(state) {
-  return state.cars.filter((car) => car.kind === 'police' && !car.wrecked && !car.leaving && car.driver !== 'player');
-}
-
-/** Drive one police car toward the player with pursuit steering and ramming weight. */
-function drivePoliceCar(state, car, dt) {
-  const player = state.player;
-  const targetX = player.x;
-  const targetY = player.y;
-  const dist = distance(car.x, car.y, targetX, targetY);
-  const lead = clamp(dist / 300, 0, 0.45);
-  const aimX = targetX + (player.car ? Math.cos(player.car.angle) * player.car.speed * lead : 0);
-  const aimY = targetY + (player.car ? Math.sin(player.car.angle) * player.car.speed * lead : 0);
-  const wantedAngle = Math.atan2(aimY - car.y, aimX - car.x);
-  const diff = angleDelta(car.angle, wantedAngle);
-  const steer = clamp(diff * 1.6, -1, 1);
-  car.angle += steer * CAR.turnRate * dt * clamp(Math.abs(car.speed) / 150, 0.25, 1) * (car.speed < 0 ? -1 : 1);
-  const topSpeed = 478;
-  if (Math.abs(diff) < 1.25) {
-    car.speed += CAR.accel * 1.12 * dt * Math.max(0.12, 1 - car.speed / topSpeed);
-  } else if (car.speed > 60) {
-    car.speed -= CAR.brake * dt;
+  for (const ped of peds) {
+    if (ped.state === 'down') continue;
+    if (Math.hypot(ped.x - x, ped.y - y) < WITNESS_PED_RANGE && lineOfSight(world, ped.x, ped.y, x, y)) return true;
   }
-  if (dist < 54 && !player.car) car.speed = Math.max(car.speed - CAR.brake * dt, 0); // pull up beside a runner
-  car.speed -= car.speed * CAR.drag * dt * 0.3;
-  car.x += Math.cos(car.angle) * car.speed * dt;
-  car.y += Math.sin(car.angle) * car.speed * dt;
+  return false;
 }
 
-/** An officer on foot: chase the player, arrest on contact, shoot at high stars. */
-function stepOfficer(state, officer, dt) {
-  const player = state.player;
-  const dist = distance(officer.x, officer.y, player.x, player.y);
-  officer.angle = Math.atan2(player.y - officer.y, player.x - officer.x);
-  const level = POLICE_BY_STAR[state.wanted];
-  if (level.officersShoot && !player.car && dist < 320 && dist > 60) {
-    // Hold position and fire in controlled bursts.
-    officer.fireCd -= dt;
-    if (officer.fireCd <= 0) {
-      officer.fireCd = 0.85 + state.rng() * 0.5;
-      state.effects.push({ kind: 'tracer', x1: officer.x, y1: officer.y, x2: player.x, y2: player.y, t: 0, ttl: 0.07, hostile: true });
-      if (state.rng() < clamp(0.62 - dist / 700, 0.15, 0.6)) {
-        player.health -= 5;
-        player.hurtT = 0;
-        state.effects.push({ kind: 'spark', x: player.x, y: player.y, t: 0, ttl: 0.25, color: '#ef4444' });
-      }
+/**
+ * Report a crime at (x, y). Unwitnessed crimes pass quietly and return false. A witnessed
+ * crime lifts the wanted level to at least its floor; a witnessed killing spree climbs.
+ */
+export function reportCrime(ctx, kind, x, y) {
+  const wanted = ctx.wanted;
+  if (kind === 'gunfire') {
+    if (wanted.gunCool > 0) return false;
+    wanted.gunCool = 2.2;
+  }
+  if (!witnessed(ctx.world, ctx.cars, ctx.peds, x, y)) return false;
+  const floor = CRIME_STARS[kind] ?? 1;
+  if (wanted.stars >= floor && (kind === 'kill' || kind === 'copkill')) {
+    wanted.stars = Math.min(5, wanted.stars + 1);
+  } else {
+    wanted.stars = Math.max(wanted.stars, floor);
+  }
+  wanted.evade = 0;
+  ctx.events.push({ type: 'crime', kind, stars: wanted.stars });
+  return true;
+}
+
+function spawnCop(rng, world, player) {
+  for (let tries = 0; tries < 14; tries += 1) {
+    const angle = rng.range(0, Math.PI * 2);
+    const dist = rng.range(680, 840);
+    const x = player.x + Math.cos(angle) * dist;
+    const y = player.y + Math.sin(angle) * dist;
+    if (x < 40 || y < 40 || x > world.width - 40 || y > world.height - 40) continue;
+    if (!isRoad(x, y)) continue;
+    // No ambushes from dead ahead of a fast-moving player: help joins from the sides
+    // and behind, where a chase can actually be escaped.
+    const playerSpeed = Math.hypot(player.vx ?? 0, player.vy ?? 0);
+    if (playerSpeed > 200) {
+      const dot = ((x - player.x) * player.vx + (y - player.y) * player.vy) / (dist * playerSpeed);
+      if (dot > 0.88) continue;
     }
-    return;
+    const car = createCar(rng, x, y, Math.atan2(player.y - y, player.x - x), 'cop', false);
+    car.driver = 'cop';
+    return car;
   }
-  if (dist > 20) {
-    const speed = 208;
-    officer.x += Math.cos(officer.angle) * speed * dt;
-    officer.y += Math.sin(officer.angle) * speed * dt;
-  }
+  return null;
 }
 
-/** Spawn or release officers: one gets out when their car stops close to a runner. */
-function manageOfficers(state, dt) {
-  const player = state.player;
-  for (const car of state.cars) {
-    if (car.kind !== 'police' || car.wrecked || car.leaving || car.driver === 'player') continue;
-    const hasOfficer = state.peds.some((ped) => ped.role === 'officer' && ped.carId === car.id);
-    if (hasOfficer) continue;
-    const dist = distance(car.x, car.y, player.x, player.y);
-    if (!player.car && dist < 150 && Math.abs(car.speed) < 90) {
-      state.spawnOfficer(car);
-    }
-  }
-  // Officers whose chase is over climb back in or give up with the car.
-  for (const ped of state.peds) {
-    if (ped.role !== 'officer') continue;
-    if (state.wanted === 0 || ped.carGone) {
-      ped.dead = true;
-      ped.fadeFast = true;
-    }
-  }
+function pursuitControl(car, player) {
+  const lead = player.car ? 0.35 : 0.12;
+  const tx = player.x + (player.vx ?? 0) * lead;
+  const ty = player.y + (player.vy ?? 0) * lead;
+  const wanted = Math.atan2(ty - car.y, tx - car.x);
+  let diff = wanted - car.angle;
+  while (diff > Math.PI) diff -= Math.PI * 2;
+  while (diff < -Math.PI) diff += Math.PI * 2;
+  const dist = Math.hypot(player.x - car.x, player.y - car.y);
+  let throttle = 1;
+  if (dist < 58) throttle = car.speed > 24 ? -0.7 : 0;
+  else if (dist < 120 && Math.abs(diff) > 2.2) throttle = -0.6;
+  return { throttle, steer: Math.max(-1, Math.min(1, diff * 2.4)) };
 }
 
-/** The whole police step: spawning, pursuit, arrests, cooling off. */
-export function stepPolice(state, dt) {
-  const player = state.player;
-  const level = POLICE_BY_STAR[state.wanted];
-
-  // Spotting: any active police unit with a clear-ish line counts as seeing the player.
-  let seen = false;
-  for (const car of state.cars) {
-    if (car.kind === 'police' && !car.wrecked && distance(car.x, car.y, player.x, player.y) < SIGHT_RANGE) seen = true;
-  }
-  for (const ped of state.peds) {
-    if (ped.role === 'officer' && !ped.dead && distance(ped.x, ped.y, player.x, player.y) < SIGHT_RANGE) seen = true;
-  }
-  state.seenByPolice = seen;
-
-  // Cooling off: unseen time sheds stars, one at a time.
-  if (state.wanted > 0) {
-    if (seen) state.hideTimer = 0;
-    else {
-      state.hideTimer += dt;
-      if (state.hideTimer >= WANTED.hideSecondsPerStar * state.wanted) {
-        state.wanted -= 1;
-        state.hideTimer = 0;
-        if (state.wanted > 0) pushMessage(state, 'The heat is cooling off…', '');
-      }
-    }
-  }
-
-  // Reinforcements: keep the hunt at strength, arriving in quick succession.
-  state.police.spawnTimer -= dt;
-  const active = activePoliceCars(state);
-  if (state.wanted > 0 && active.length < level.cars && state.police.spawnTimer <= 0) {
-    state.spawnPoliceCar();
-    state.police.spawnTimer = REINFORCE_EVERY;
-  }
-  // When the heat dies, the hunt breaks off: cars leave and are cleaned up far away.
-  if (state.wanted === 0) {
-    for (const car of state.cars) {
-      if (car.kind === 'police' && !car.wrecked) car.leaving = true;
-    }
-  }
-
-  for (const car of state.cars) {
-    if (car.kind !== 'police' || car.wrecked || car.driver === 'player') continue;
-    if (car.leaving) {
-      car.speed = Math.min(car.speed + CAR.accel * dt * 0.5, 240);
-      car.x += Math.cos(car.angle) * car.speed * dt;
-      car.y += Math.sin(car.angle) * car.speed * dt;
-      if (distance(car.x, car.y, player.x, player.y) > 980) car.removeMe = true;
+/**
+ * Run the police for one step: spawn to strength, pursue, watch for the player, fill the
+ * arrest meter when an officer has the player pinned, and let stars fade once the player
+ * has truly broken contact. Calls ctx.onBusted() when an arrest completes.
+ */
+export function stepPolice(ctx, dt) {
+  const { world, rng, cars, player, wanted } = ctx;
+  wanted.gunCool = Math.max(0, wanted.gunCool - dt);
+  let cops = 0;
+  let anySee = false;
+  let pinning = false;
+  for (let i = cars.length - 1; i >= 0; i -= 1) {
+    const car = cars[i];
+    if (car.kind !== 'cop' || car.driver !== 'cop') continue;
+    cops += 1;
+    const dist = Math.hypot(car.x - player.x, car.y - player.y);
+    if (wanted.stars === 0) {
+      if (dist > 760) { cars.splice(i, 1); cops -= 1; }
       continue;
     }
-    drivePoliceCar(state, car, dt);
+    stepCar(world, car, dt, pursuitControl(car, player));
+    if (dist < 640 && lineOfSight(world, car.x, car.y, player.x, player.y)) anySee = true;
+    const playerSpeed = player.car ? Math.abs(player.car.speed) : player.speedNow;
+    // An arrest needs the officer stopped with the player, not a high-speed shunt.
+    if (dist < 56 && playerSpeed < 46 && Math.abs(car.speed) < 130) pinning = true;
   }
-
-  manageOfficers(state, dt);
-  for (const ped of state.peds) {
-    if (ped.role === 'officer' && !ped.dead) stepOfficer(state, ped, dt);
-  }
-
-  // Arrests: an officer on top of a runner, or cars pinning a stopped driver.
-  let arrestPressure = 0;
-  if (!player.car) {
-    for (const ped of state.peds) {
-      if (ped.role === 'officer' && !ped.dead && distance(ped.x, ped.y, player.x, player.y) < ARREST_RANGE) arrestPressure = 1.15;
+  if (wanted.stars > 0) {
+    wanted.spawnTimer -= dt;
+    if (cops < COPS_PER_STAR[wanted.stars] && wanted.spawnTimer <= 0) {
+      const car = spawnCop(rng, world, player);
+      if (car) { cars.push(car); wanted.spawnTimer = COP_SPAWN_INTERVAL; }
+      else wanted.spawnTimer = 0.3;
     }
-  } else if (Math.abs(player.car.speed) < 26) {
-    for (const car of active) {
-      if (distance(car.x, car.y, player.x, player.y) < CAR_ARREST_RANGE) arrestPressure = 0.55;
+    if (anySee) { wanted.evade = 0; wanted.seen = true; }
+    else {
+      wanted.seen = false;
+      wanted.evade += dt;
+      if (wanted.evade >= EVADE_TIME) {
+        wanted.stars -= 1;
+        wanted.evade = 0;
+        ctx.events.push({ type: 'star-down', stars: wanted.stars });
+      }
     }
-  }
-  if (arrestPressure > 0 && state.wanted > 0) {
-    player.bustedMeter = Math.min(1, player.bustedMeter + arrestPressure * dt);
-    if (player.bustedMeter >= 1) state.flags.busted = true;
+    if (pinning) {
+      wanted.bust += dt;
+      if (wanted.bust >= BUST_TIME) ctx.onBusted();
+    } else {
+      wanted.bust = Math.max(0, wanted.bust - dt * 2.2);
+    }
   } else {
-    player.bustedMeter = Math.max(0, player.bustedMeter - dt * 0.7);
+    wanted.bust = 0;
+    wanted.evade = 0;
+    wanted.seen = false;
   }
-}
-
-function pushMessage(state, text, sub) {
-  state.message = { text, sub, t: 0, ttl: 2.4 };
 }

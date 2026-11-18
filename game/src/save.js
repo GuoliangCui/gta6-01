@@ -1,40 +1,42 @@
-// The save file: money and story progress in localStorage, nothing else. It is
-// written whenever the simulation marks itself dirty (a job paid out, a fine
-// landed) and read once at boot for the Continue option on the title screen.
+// The save: cash and story progress in localStorage, nothing else. Rio always wakes up
+// at the harbour; what he has earned and which jobs are done is what persists. Storage
+// can be unavailable (private windows), so every access is guarded and the game simply
+// runs session-only when it is.
 import { SAVE_KEY } from './config.js';
 
-/** The stored progress, or null when there is none worth continuing. */
+/** Read the save, or null when there is none worth trusting. */
 export function loadSave() {
   try {
     const raw = window.localStorage.getItem(SAVE_KEY);
     if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    const money = Number.isFinite(parsed.money) ? Math.max(0, Math.floor(parsed.money)) : null;
-    const missionsDone = Number.isFinite(parsed.missionsDone) ? Math.min(3, Math.max(0, Math.floor(parsed.missionsDone))) : 0;
-    if (money === null) return null;
-    return { money, missionsDone };
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object') return null;
+    return {
+      money: Math.max(0, Math.floor(Number(data.money) || 0)),
+      missionIndex: Math.max(0, Math.min(3, Math.floor(Number(data.missionIndex) || 0))),
+    };
   } catch {
     return null;
   }
 }
 
-/** Persist the player's money and how many of the three jobs are done. */
-export function writeSave(state) {
+/** Persist the simulation's money and story progress. */
+export function writeSave(sim) {
   try {
     window.localStorage.setItem(SAVE_KEY, JSON.stringify({
-      money: state.player.money,
-      missionsDone: state.missions.index,
+      money: sim.money,
+      missionIndex: sim.missions.index,
     }));
   } catch {
-    // Private windows and full disks: the story then lasts this visit only.
+    // Session-only play: nothing to do.
   }
 }
 
-/** Forget the save (a fresh New Game from the title screen). */
+/** Forget the save (a fresh new game). */
 export function clearSave() {
   try {
     window.localStorage.removeItem(SAVE_KEY);
   } catch {
-    // Nothing to forget twice.
+    // Nothing to forget.
   }
 }

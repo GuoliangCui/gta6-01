@@ -1,34 +1,38 @@
-// A seeded random source (an LCG with a good spread) plus the small helpers the
-// simulation uses everywhere. One seed always makes the same city, the same
-// traffic and the same screenshot scenes — nothing in the game calls Math.random.
+// A seeded random source (mulberry32). The whole simulation draws from streams made here,
+// never from Math.random, so a seed plus an input script always replays the same game —
+// that is what makes the screenshot scenes and the headless tests deterministic.
 
-const MULTIPLIER = 1664525;
-const INCREMENT = 1013904223;
-const MODULUS = 4294967296;
-
-/** Create a random function returning [0, 1), with range/pick helpers attached. */
+/** Create a random stream from a 32-bit seed. */
 export function createRandom(seed) {
-  let state = (seed >>> 0) || 1;
-  function random() {
-    state = (Math.imul(state, MULTIPLIER) + INCREMENT) >>> 0;
-    return state / MODULUS;
+  let state = seed >>> 0;
+  function next() {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   }
-  /** A float in [min, max). */
-  random.range = (min, max) => min + random() * (max - min);
-  /** An integer in [min, max], both ends included. */
-  random.int = (min, max) => min + Math.floor(random() * (max - min + 1));
-  /** True with probability p. */
-  random.chance = (p) => random() < p;
-  /** One element of a non-empty array. */
-  random.pick = (items) => items[Math.floor(random() * items.length)];
-  return random;
-}
-
-/** Mix a seed with a label so sub-systems (city, traffic) draw independent streams. */
-export function deriveSeed(seed, salt) {
-  let h = (seed >>> 0) ^ 0x9e3779b9;
-  for (let i = 0; i < salt.length; i += 1) {
-    h = Math.imul(h ^ salt.charCodeAt(i), 2654435761) >>> 0;
-  }
-  return h >>> 0;
+  return {
+    next,
+    /** Float in [min, max). */
+    range(min, max) {
+      return min + next() * (max - min);
+    },
+    /** Integer in [min, max], both ends included. */
+    int(min, max) {
+      return min + Math.floor(next() * (max - min + 1));
+    },
+    /** True with probability p. */
+    chance(p) {
+      return next() < p;
+    },
+    /** One element of a non-empty array. */
+    pick(items) {
+      return items[Math.floor(next() * items.length)];
+    },
+    /** A fresh independent stream, for a subsystem that wants its own sequence. */
+    fork() {
+      return createRandom(Math.floor(next() * 4294967296));
+    },
+  };
 }
