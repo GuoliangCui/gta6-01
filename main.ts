@@ -1,13 +1,12 @@
-// Neon Harbor — a gta6-01 entry (Node 22, standard library only): the game is this
-// directory's game/ folder, plain static files a desktop browser loads offline
-// (game/index.html and its ES modules, no library and no network request), and the
-// program hands it in. It copies game/ and screenshots/ from beside this file to
-// /output and writes /output/dossier.json, the summary the judge reads, with the
-// vendored make.fun library. The game itself: a top-down open-world crime game in
-// pure Canvas 2D — a procedurally built harbour city with traffic and pedestrians,
-// cars to steal and drive, a five-star wanted system with police who pursue and
-// arrest, gun combat, a three-job story with dialogue, a HUD with a live minimap,
-// localStorage saves and fully synthesised WebAudio sound.
+// Neon Harbor — a gta6-01 entry (Node 22, standard library only). The game is this
+// directory's game/ folder: an original open-world harbour city in plain static files a
+// desktop browser loads offline (game/index.html and its ES modules, no library and no
+// network request). Rio, a courier, works three jobs for the fixer Marina — a timed
+// delivery, a stolen convertible, a warehouse crew to clear — in a city with traffic,
+// pedestrians, witness-based wanted levels and fast police pursuit, all drawn on canvas
+// with synthesized sound. This program hands it in: it copies game/ and screenshots/
+// from beside this file to /output and writes /output/dossier.json, the summary the
+// judge reads, with the vendored make.fun library.
 //
 // Serve it locally with `node serve.ts`, then open http://localhost:8080.
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
