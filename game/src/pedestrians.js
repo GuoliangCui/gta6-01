@@ -1,90 +1,103 @@
-// Pedestrians: harbour folk strolling the sidewalks and the promenade. They amble between
-// corners, keep out of the buildings, and run from gunfire, crashes and speeding cars.
-// A person knocked down stays down — the simulation counts the cost.
-import { PED_TARGET, ROADS_H, ROADS_V } from './config.js';
-import { collideCircle, isWater } from './world.js';
+// Pedestrians: harbour-town folk strolling the sidewalk loop around their block. They keep
+// to the pavement, panic and run when a shot rings out or a car bears down on them, and fall
+// when a car does not stop. A fallen pedestrian is the city's fastest way to earn a star.
+import { PED_COUNT, PALETTE } from './config.js';
+import { collideCircle, sidewalkLoops } from './world.js';
 
-const SHIRTS = ['#ff6b6b', '#feca57', '#48dbfb', '#1dd1a1', '#f368e0', '#ff9f43', '#54a0ff', '#5f27cd', '#c8d6e5'];
-
-/** Create one pedestrian at a sidewalk point. */
-export function createPed(rng, x, y) {
+export function createPed(rng, loops) {
+  const loop = rng.pick(loops);
+  const perimeter = 2 * (loop.w + loop.h);
   return {
-    x, y,
-    angle: rng.range(0, Math.PI * 2),
-    speed: 0,
-    hp: 100,
-    state: 'walk',
-    color: rng.pick(SHIRTS),
-    wx: x,
-    wy: y,
-    panic: 0,
-    think: rng.range(0, 0.4),
+    loop,
+    s: rng.range(0, perimeter), // distance along the loop
+    dir: rng.chance(0.5) ? 1 : -1,
+    speed: rng.range(38, 62),
+    x: 0, y: 0, vx: 0, vy: 0,
+    colour: rng.pick(PALETTE.ped),
+    flee: 0,
+    fleeX: 0,
+    fleeY: 0,
+    down: 0, // seconds spent on the ground; 0 = upright
+    angle: 0,
   };
 }
 
-function pickStrollTarget(rng, ped) {
-  // Sidewalks live just off the road centre lines; aim for a point along one of them.
-  const vertical = rng.chance(0.5);
-  const centre = vertical ? rng.pick(ROADS_V) : rng.pick(ROADS_H);
-  const side = rng.chance(0.5) ? -72 : 72;
-  const along = rng.range(80, vertical ? 2440 : 3520);
-  ped.wx = vertical ? centre + side : along;
-  ped.wy = vertical ? along : centre + side;
+export function seedPeds(state) {
+  const loops = sidewalkLoops(state.world);
+  for (let i = 0; i < PED_COUNT; i += 1) {
+    const ped = createPed(state.rng, loops);
+    placeOnLoop(ped, 0);
+    state.peds.push(ped);
+  }
 }
 
-/** Spawn pedestrians on sidewalks within sight of the player, up to PED_TARGET. */
-export function stepPedestrians(rng, world, peds, focus, dt) {
-  let alive = 0;
-  for (const ped of peds) if (ped.state !== 'down') alive += 1;
-  if (alive < PED_TARGET) {
-    for (let tries = 0; tries < 6; tries += 1) {
-      const x = focus.x + rng.range(-560, 560);
-      const y = focus.y + rng.range(-420, 420);
-      if (x < 20 || y < 20 || x > world.width - 20 || y > world.height - 20) continue;
-      if (isWater(world, x, y)) continue;
-      const ped = createPed(rng, x, y);
-      if (collideCircle(world, ped, 10)) continue;
-      pickStrollTarget(rng, ped);
-      peds.push(ped);
-      break;
+function placeOnLoop(ped, dt) {
+  const { loop } = ped;
+  const perimeter = 2 * (loop.w + loop.h);
+  ped.s = ((ped.s + ped.dir * ped.speed * dt) % perimeter + perimeter) % perimeter;
+  let s = ped.s;
+  if (s < loop.w) { ped.x = loop.x + s; ped.y = loop.y; ped.angle = ped.dir > 0 ? 0 : Math.PI; }
+  else if ((s -= loop.w) < loop.h) { ped.x = loop.x + loop.w; ped.y = loop.y + s; ped.angle = ped.dir > 0 ? Math.PI / 2 : -Math.PI / 2; }
+  else if ((s -= loop.h) < loop.w) { ped.x = loop.x + loop.w - s; ped.y = loop.y + loop.h; ped.angle = ped.dir > 0 ? Math.PI : 0; }
+  else { s -= loop.w; ped.x = loop.x; ped.y = loop.y + loop.h - s; ped.angle = ped.dir > 0 ? -Math.PI / 2 : Math.PI / 2; }
+  if (ped.dir < 0) ped.angle += Math.PI;
+}
+
+/** Something frightening happened at (x, y): nearby pedestrians run from it. */
+export function scarePeds(state, x, y, radius) {
+  for (const ped of state.peds) {
+    if (ped.down) continue;
+    const d = Math.hypot(ped.x - x, ped.y - y);
+    if (d < radius) {
+      ped.flee = state.rng.range(2.2, 3.6);
+      const a = Math.atan2(ped.y - y, ped.x - x);
+      ped.fleeX = Math.cos(a);
+      ped.fleeY = Math.sin(a);
     }
   }
-  for (let i = peds.length - 1; i >= 0; i -= 1) {
-    const ped = peds[i];
-    if (Math.hypot(ped.x - focus.x, ped.y - focus.y) > 1250 && ped.state !== 'down') {
-      peds.splice(i, 1);
+}
+
+export function updatePeds(state, dt) {
+  for (const ped of state.peds) {
+    if (ped.down) {
+      ped.down += dt;
+      ped.vx = 0;
+      ped.vy = 0;
       continue;
     }
-    if (ped.state === 'down') continue;
-    ped.think -= dt;
-    if (ped.panic > 0) ped.panic -= dt;
-    const fleeing = ped.panic > 0;
-    if (ped.think <= 0 && !fleeing) {
-      ped.think = rng.range(0.2, 0.5);
-      if (Math.hypot(ped.wx - ped.x, ped.wy - ped.y) < 24) pickStrollTarget(rng, ped);
+    if (ped.flee > 0) {
+      ped.flee -= dt;
+      ped.x += ped.fleeX * 148 * dt;
+      ped.y += ped.fleeY * 148 * dt;
+      ped.angle = Math.atan2(ped.fleeY, ped.fleeX);
+      collideCircle(state.world, ped, 10);
+      continue;
     }
-    const tx = fleeing ? ped.x + Math.cos(ped.angle) * 120 : ped.wx;
-    const ty = fleeing ? ped.y + Math.sin(ped.angle) * 120 : ped.wy;
-    const wanted = Math.atan2(ty - ped.y, tx - ped.x);
-    let diff = wanted - ped.angle;
-    while (diff > Math.PI) diff -= Math.PI * 2;
-    while (diff < -Math.PI) diff += Math.PI * 2;
-    ped.angle += Math.max(-3.4 * dt, Math.min(3.4 * dt, diff));
-    const top = fleeing ? 215 : 74;
-    ped.speed += ((Math.abs(diff) < 1.2 ? top : top * 0.3) - ped.speed) * Math.min(1, dt * 5);
-    ped.x += Math.cos(ped.angle) * ped.speed * dt;
-    ped.y += Math.sin(ped.angle) * ped.speed * dt;
-    collideCircle(world, ped, 10);
+    // A car coming straight at them clears the pavement faster than any siren.
+    let danger = null;
+    for (const car of state.cars) {
+      if (Math.abs(car.speed) < 60) continue;
+      const d = Math.hypot(car.x - ped.x, car.y - ped.y);
+      if (d < 64) {
+        const toward = ((ped.x - car.x) * car.vx + (ped.y - car.y) * car.vy) / (Math.abs(car.speed) + 1);
+        if (toward > 20) { danger = car; break; }
+      }
+    }
+    if (danger) {
+      ped.flee = 0.7;
+      const a = Math.atan2(ped.y - danger.y, ped.x - danger.x);
+      ped.fleeX = Math.cos(a);
+      ped.fleeY = Math.sin(a);
+      continue;
+    }
+    placeOnLoop(ped, dt);
   }
 }
 
-/** Send every pedestrian near a point running from it (a shot, a crash, a stolen car). */
-export function scarePeds(peds, x, y, radius) {
-  for (const ped of peds) {
-    if (ped.state === 'down') continue;
-    if (Math.hypot(ped.x - x, ped.y - y) < radius) {
-      ped.panic = 2.6;
-      ped.angle = Math.atan2(ped.y - y, ped.x - x);
-    }
-  }
+/** Knock a pedestrian down (a car did it). Returns true the moment it happens. */
+export function knockDown(ped) {
+  if (ped.down) return false;
+  ped.down = 0.001;
+  ped.flee = 0;
+  return true;
 }
